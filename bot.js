@@ -67,6 +67,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 
 // --- Audio/Clip Buffering and State ---
 let currentChannelId = null;
+let currentConnection = null; // active voice connection, if any
 const CLIP_SECONDS = 30;
 const CLIP_SAMPLE_RATE = 48000;
 const CLIP_CHANNELS = 2;
@@ -74,6 +75,8 @@ const CLIP_BYTES_PER_SAMPLE = 2; // 16-bit PCM
 const CLIP_BUFFER_SIZE = CLIP_SAMPLE_RATE * CLIP_CHANNELS * CLIP_BYTES_PER_SAMPLE * CLIP_SECONDS;
 let rollingPcmBuffer = Buffer.alloc(0); // legacy, not used by new ring-mix path
 let lastClipInfo = null; // { filename, username, timestamp }
+// Require users to be in a channel this long before we consider joining (ms)
+const MIN_STABLE_MS = 3000;
 
 // Per-user rolling ring buffers for 30s of 48kHz stereo Int16 PCM
 const TOTAL_CLIP_SAMPLES = CLIP_SAMPLE_RATE * CLIP_CHANNELS * CLIP_SECONDS; // Int16 samples (not bytes)
@@ -372,10 +375,17 @@ function getMostPopulatedVoiceChannel(guild) {
   const now = Date.now();
   guild.channels.cache.forEach(channel => {
     if (channel.type === 2) { // 2 = GUILD_VOICE
+      // Skip ignored voice channels for this guild
+      const gcfg = config.guilds[guild.id] || {};
+      const ignored = new Set(gcfg.ignoredVoiceChannels || []);
+      if (ignored.has(channel.id)) return;
       let count = 0;
       for (const [userId, member] of channel.members) {
         const joinMap = userJoinTimestamps[guild.id] || {};
-        if (joinMap[userId] && now - joinMap[userId] > 1000) {
+        // Skip the bot itself
+        if (client.user && userId === client.user.id) continue;
+        // Only count users with sufficient stability
+        if (joinMap[userId] && now - joinMap[userId] >= MIN_STABLE_MS) {
           count++;
         }
       }
@@ -395,14 +405,35 @@ function getMostPopulatedVoiceChannel(guild) {
 // }
 
 // --- Join a voice channel and monitor audio, transcribe, and handle clips ---
+function leaveVoiceChannel(reason = '') {
+  try {
+    if (monitorInterval) {
+      clearInterval(monitorInterval);
+      monitorInterval = null;
+    }
+    if (currentConnection) {
+      try { currentConnection.destroy(); } catch (_) {}
+      currentConnection = null;
+    }
+    currentChannelId = null;
+    updateWebMembers(null);
+  } catch (_) {}
+}
+
 function joinAndMonitor(channel) {
   currentChannelId = channel.id;
   updateWebMembers(channel);
-  const connection = joinVoiceChannel({
+  currentConnection = joinVoiceChannel({
     channelId: channel.id,
     guildId: channel.guild.id,
     adapterCreator: channel.guild.voiceAdapterCreator
   });
+  // Handle receiver-level errors (e.g., DAVE decryption hiccups)
+  try {
+    currentConnection.receiver.on('error', (err) => {
+      console.warn('[voice receiver error]', err && err.code ? err.code : String(err));
+    });
+  } catch (_) {}
 
   // Clear previous interval if any
   if (monitorInterval) {
@@ -413,10 +444,18 @@ function joinAndMonitor(channel) {
   // Track which user streams are already being handled
   const activeStreams = new Set();
   monitorInterval = setInterval(() => {
+    // If no non-bot members remain in the channel, leave
+    const botId = client.user?.id;
+    const nonBots = Array.from(channel.members.values()).filter(m => m.id !== botId);
+    if (nonBots.length === 0) {
+      leaveVoiceChannel('alone');
+      return;
+    }
+
     for (const [userId, member] of channel.members) {
       if (!activeStreams.has(userId)) {
         activeStreams.add(userId);
-        const opusStream = connection.receiver.subscribe(userId, {
+        const opusStream = currentConnection.receiver.subscribe(userId, {
           end: {
             behavior: EndBehaviorType.AfterSilence,
             duration: 1000
@@ -548,6 +587,12 @@ function joinAndMonitor(channel) {
         opusStream.on('end', () => {
           activeStreams.delete(userId);
         });
+        opusStream.on('error', (err) => {
+          // Common transient: DAVE decryption failure; ignore and clean up
+          console.warn(`[audio stream error] user ${userId}:`, err && err.code ? err.code : String(err));
+          activeStreams.delete(userId);
+          try { member.whisperPcmBuffer = []; } catch (_) {}
+        });
       }
     }
   }, 2000); // Check every 2 seconds for new users
@@ -617,6 +662,9 @@ client.on('messageCreate', async (message) => {
         '- -clip: Create a 30s clip of recent voice (DM if toggled, else post to clip channel)',
         '- -dmtoggle: Toggle DM delivery of clips for yourself',
         '- -setclip <channel_id|#mention>: Server owner only, sets the text channel to post clips',
+  '- -ignorevc <channel_id|#mention>: Server owner only, ignore a voice channel for auto-join',
+  '- -unignorevc <channel_id|#mention>: Server owner only, remove a voice channel from ignore list',
+  '- -listignorevc: List ignored voice channels',
         '',
         '**Voice trigger**',
         '- Say "terry clip that" to create a 30s clip',
@@ -624,6 +672,76 @@ client.on('messageCreate', async (message) => {
       ].join('\n');
       try { await message.reply(helpText); } catch (_) {}
       return;
+    }
+
+    // Owner-only: ignore a voice channel for auto-join
+    if (content.startsWith('-ignorevc')) {
+      if (message.guild.ownerId !== message.author.id) {
+        try { await message.reply('You must be the server owner to use this.'); } catch (_) {}
+        return;
+      }
+      const arg = String(message.content || '').trim().split(/\s+/)[1] || '';
+      const match = arg && arg.match(/^(?:<#)?(\d{10,})(?:>)?$/);
+      if (!match) {
+        try { await message.reply('Usage: -ignorevc <channel_id or #mention>'); } catch (_) {}
+        return;
+      }
+      const chanId = match[1];
+      const ch = message.guild.channels.cache.get(chanId);
+      if (!ch || ch.type !== 2) { // 2 = GUILD_VOICE
+        try { await message.reply('That is not a voice channel.'); } catch (_) {}
+        return;
+      }
+      if (!config.guilds[message.guild.id]) config.guilds[message.guild.id] = {};
+      if (!config.guilds[message.guild.id].ignoredVoiceChannels) config.guilds[message.guild.id].ignoredVoiceChannels = [];
+      const list = config.guilds[message.guild.id].ignoredVoiceChannels;
+      if (!list.includes(chanId)) list.push(chanId);
+      saveConfig();
+      try { await message.reply(`Ignored voice channel: <#${chanId}>`); } catch (_) {}
+      if (currentChannelId === chanId) {
+        leaveVoiceChannel('ignored');
+      }
+    }
+
+    // Owner-only: unignore a voice channel
+    if (content.startsWith('-unignorevc')) {
+      if (message.guild.ownerId !== message.author.id) {
+        try { await message.reply('You must be the server owner to use this.'); } catch (_) {}
+        return;
+      }
+      const arg = String(message.content || '').trim().split(/\s+/)[1] || '';
+      const match = arg && arg.match(/^(?:<#)?(\d{10,})(?:>)?$/);
+      if (!match) {
+        try { await message.reply('Usage: -unignorevc <channel_id or #mention>'); } catch (_) {}
+        return;
+      }
+      const chanId = match[1];
+      if (!config.guilds[message.guild.id]) config.guilds[message.guild.id] = {};
+      const list = config.guilds[message.guild.id].ignoredVoiceChannels || [];
+      const idx = list.indexOf(chanId);
+      if (idx !== -1) {
+        list.splice(idx, 1);
+        config.guilds[message.guild.id].ignoredVoiceChannels = list;
+        saveConfig();
+        try { await message.reply(`Unignored voice channel: <#${chanId}>`); } catch (_) {}
+      } else {
+        try { await message.reply('That channel was not ignored.'); } catch (_) {}
+      }
+    }
+
+    // List ignored voice channels
+    if (content === '-listignorevc') {
+      const gcfg = config.guilds[message.guild.id] || {};
+      const list = gcfg.ignoredVoiceChannels || [];
+      if (!list.length) {
+        try { await message.reply('No ignored voice channels.'); } catch (_) {}
+        return;
+      }
+      const names = list.map(id => {
+        const ch = message.guild.channels.cache.get(id);
+        return ch ? `• ${ch.name} (<#${id}>)` : `• <#${id}>`;
+      }).join('\n');
+      try { await message.reply(`Ignored voice channels:\n${names}`); } catch (_) {}
     }
     if (content === '-clip' || content.startsWith('-clip ')) {
       handleVoiceClipCommand(message.author.username, message.author.id);
@@ -684,12 +802,21 @@ setInterval(() => {
     }
   });
   const channel = getMostPopulatedVoiceChannel(guild);
-  // Only join if not already in a channel and eligible users are present
-  if (channel && channel.id !== currentChannelId && channel.members && channel.members.size > 0) {
-    // Exclude bot from count
+  // If currently connected, check if we became alone; if so, leave
+  if (currentChannelId) {
+    const curr = guild.channels.cache.get(currentChannelId);
+    if (!curr || (curr.members && Array.from(curr.members.values()).filter(m => m.id !== client.user.id).length === 0)) {
+      leaveVoiceChannel('periodic-empty');
+    }
+  }
+  // Only join if not already in a channel and eligible users are present and stable
+  if (!currentChannelId && channel && channel.members && channel.members.size > 0) {
     const botId = client.user.id;
+    const now2 = Date.now();
     const realMembers = Array.from(channel.members.values()).filter(m => m.id !== botId);
-    if (realMembers.length > 0) {
+    const joinMap = userJoinTimestamps[guild.id] || {};
+    const hasStable = realMembers.some(m => joinMap[m.id] && (now2 - joinMap[m.id]) >= MIN_STABLE_MS);
+    if (realMembers.length > 0 && hasStable) {
       joinAndMonitor(channel);
     }
   }
