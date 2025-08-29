@@ -1,4 +1,7 @@
 {
+  "scripts": {
+    "start": "node bot.js"
+  },
   "dependencies": {
     "@deepgram/sdk": "^4.11.2",
     "@discordjs/opus": "^0.10.0",
