@@ -475,6 +475,21 @@ client.on('messageCreate', async (message) => {
     if (!message || message.author?.bot) return;
     if (!message.guild) return;
     const content = String(message.content || '').trim().toLowerCase();
+    // Help: list all commands and voice trigger
+    if (content === '-help' || content === '-commands') {
+      const helpText = [
+        '**Commands**',
+        '- -help | -commands: Show this help',
+        '- -clip: Create a 30s clip of recent voice (DM if toggled, else post to clip channel)',
+        '- -dmtoggle: Toggle DM delivery of clips for yourself',
+        '- -setclip <channel_id|#mention>: Server owner only, sets the text channel to post clips',
+        '',
+        '**Voice trigger**',
+        '- Say "terry clip that" to create a 30s clip',
+      ].join('\n');
+      try { await message.reply(helpText); } catch (_) {}
+      return;
+    }
     if (content === '-clip' || content.startsWith('-clip ')) {
       handleVoiceClipCommand(message.author.username, message.author.id);
       try { await message.react('🎬'); } catch (_) {}
