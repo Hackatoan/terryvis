@@ -4,3 +4,4 @@ node_modules/
 *.log
 public/clips/
 models/
+clips-config.json

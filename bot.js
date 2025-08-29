@@ -232,6 +232,135 @@ const userJoinTimestamps = {};
 // Track last emitted transcript per user to suppress duplicates
 const lastTranscriptByUser = new Map();
 
+// --- Intent detection: contextual, fuzzy "terry clip that" variants ---
+// Keep a short rolling transcript context per user (last ~6s) to catch split utterances
+const transcriptHistoryByUser = new Map(); // userId -> Array<{ text: string, t: number }>
+const lastClipTriggerByUser = new Map(); // userId -> timestamp ms
+
+function appendTranscriptContext(userId, text) {
+  const now = Date.now();
+  const arr = transcriptHistoryByUser.get(userId) || [];
+  arr.push({ text: String(text || ''), t: now });
+  // Keep only ~6 seconds of context
+  const cutoff = now - 6000;
+  while (arr.length && arr[0].t < cutoff) arr.shift();
+  transcriptHistoryByUser.set(userId, arr);
+}
+
+function getContextText(userId) {
+  const arr = transcriptHistoryByUser.get(userId) || [];
+  return arr.map(x => String(x.text || '').toLowerCase()).join(' ');
+}
+
+function shouldTriggerClipFromContext(userId) {
+  const now = Date.now();
+  const last = lastClipTriggerByUser.get(userId) || 0;
+  // Cooldown to avoid duplicate triggers
+  if (now - last < 4000) return false;
+  const ctx = getContextText(userId);
+  if (!ctx) return false;
+  // Common ASR confusions: clip/click
+  const clipWord = '(?:clip|click)';
+  // Pattern A: "terry" within ~5 words of clip
+  const patA = new RegExp(`\\bterry\\b[\\s,]*(?:\\w+\\s+){0,5}?${clipWord}\\b(?:\\s+(?:it|that|this))?`);
+  // Pattern B: clip that ... terry
+  const patB = new RegExp(`${clipWord}\\b(?:\\s+(?:it|that|this))?(?:\\s+\\w+){0,5}\\s+terry\\b`);
+  // Pattern C: polite/openers then terry then clip
+  const openers = '(?:ok(?:ay)?|al+right|all right|hey|yo)';
+  const patC = new RegExp(`\\b${openers}\\b[\\s,]*terry[\\s,]*(?:\\w+\\s+){0,4}?${clipWord}\\b(?:\\s+(?:it|that|this))?`);
+  // Pattern D: short forms like "terry clip" or "terry, clip"
+  const patD = new RegExp(`\\bterry[\\s,]*${clipWord}\\b`);
+
+  const matched = patA.test(ctx) || patB.test(ctx) || patC.test(ctx) || patD.test(ctx);
+  if (matched) {
+    lastClipTriggerByUser.set(userId, now);
+    // Clear context to reduce immediate retrigger from same words
+    transcriptHistoryByUser.set(userId, []);
+    return true;
+  }
+
+  // --- Fuzzy fallback: allow near-misses like "club that" near "terry" ---
+  // Levenshtein distance for small words
+  function lev(a, b) {
+    a = a.toLowerCase(); b = b.toLowerCase();
+    const m = a.length, n = b.length;
+    const dp = Array.from({ length: m + 1 }, () => new Array(n + 1));
+    for (let i = 0; i <= m; i++) dp[i][0] = i;
+    for (let j = 0; j <= n; j++) dp[0][j] = j;
+    for (let i = 1; i <= m; i++) {
+      for (let j = 1; j <= n; j++) {
+        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+        dp[i][j] = Math.min(
+          dp[i - 1][j] + 1,
+          dp[i][j - 1] + 1,
+          dp[i - 1][j - 1] + cost
+        );
+      }
+    }
+    return dp[m][n];
+  }
+
+  function normalizeTok(tok) {
+    return (tok || '').toLowerCase().replace(/[^a-z]/g, '');
+  }
+
+  const nearClipWhitelist = new Set(['clip', 'click', 'clips', 'clipped', 'cliff', 'club']);
+  function looksLikeClipCore(t) {
+    if (!t) return false;
+    if (nearClipWhitelist.has(t)) return true;
+    // Distance threshold of 1 for very short word
+    return lev(t, 'clip') <= 1;
+  }
+  function looksLikeClip(tok) {
+    const t = normalizeTok(tok);
+    if (!t) return false;
+    if (looksLikeClipCore(t)) return true;
+    // Handle re- prefixed single token like "reclip"
+    if (t.startsWith('re') && looksLikeClipCore(t.slice(2))) return true;
+    return false;
+  }
+
+  const words = ctx.split(/\s+/).map(w => w.trim()).filter(Boolean);
+  const lower = words.map(w => normalizeTok(w));
+  const terryIdx = lower.map((w, i) => ({ w, i })).filter(x => x.w === 'terry').map(x => x.i);
+
+  // Case 1: after "terry", within 5 tokens, a near-clip word (supports "re clip" and "reclip")
+  for (const ti of terryIdx) {
+    for (let j = ti + 1; j <= Math.min(lower.length - 1, ti + 5); j++) {
+      const tok = lower[j];
+      const nextTok = lower[j + 1] || '';
+      if (looksLikeClip(tok) || (tok === 're' && looksLikeClipCore(nextTok))) {
+        lastClipTriggerByUser.set(userId, now);
+        transcriptHistoryByUser.set(userId, []);
+        return true;
+      }
+    }
+  }
+
+  // Case 2: pattern like "(clip~) (that|it|this) ... terry" within a short window
+  const pronouns = new Set(['that', 'it', 'this']);
+  for (let i = 0; i < lower.length; i++) {
+    const tok = lower[i];
+    const isClipish = looksLikeClip(tok) || (tok === 're' && looksLikeClipCore(lower[i + 1] || ''));
+    if (isClipish) {
+      const pronTok = tok === 're' ? (lower[i + 2] || '') : (lower[i + 1] || '');
+      const hasPron = pronouns.has(pronTok);
+      // search for terry within next 5 tokens (offset depends on whether two-token form is used)
+      const start = tok === 're' ? i + 3 : i + 2;
+      if (hasPron) {
+        for (let k = start; k <= Math.min(lower.length - 1, start + 5); k++) {
+          if (lower[k] === 'terry') {
+            lastClipTriggerByUser.set(userId, now);
+            transcriptHistoryByUser.set(userId, []);
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
 
 // --- Utility: Find the most populated voice channel (excluding users joined <1s ago) ---
 function getMostPopulatedVoiceChannel(guild) {
@@ -367,8 +496,9 @@ function joinAndMonitor(channel) {
                       text: transcriptText,
                       timestamp: Date.now()
                     });
-                    // Voice command: "terry clip that" (robust to punctuation/spacing)
-                    if (/\bterry[\s,]*clip that\b[.!?\s]*/i.test(transcriptText)) {
+                    // Add to short context and check flexible trigger phrases
+                    appendTranscriptContext(userId, transcriptText);
+                    if (shouldTriggerClipFromContext(userId)) {
                       handleVoiceClipCommand(userName, userId);
                     }
                   }
@@ -397,7 +527,8 @@ function joinAndMonitor(channel) {
                         text: transcriptText,
                         timestamp: Date.now()
                       });
-                      if (/\bterry[\s,]*clip that\b[.!?\s]*/i.test(transcriptText)) {
+                      appendTranscriptContext(userId, transcriptText);
+                      if (shouldTriggerClipFromContext(userId)) {
                         handleVoiceClipCommand(userName, userId);
                       }
                     
@@ -486,6 +617,7 @@ client.on('messageCreate', async (message) => {
         '',
         '**Voice trigger**',
         '- Say "terry clip that" to create a 30s clip',
+        '- Also works with common variants like: "terry clip", "okay terry, clip that", or split phrases like "all right, terry" then "you click that" within a few seconds',
       ].join('\n');
       try { await message.reply(helpText); } catch (_) {}
       return;
