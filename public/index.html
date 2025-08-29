@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Discord Voice Channel Monitor</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #23272a; color: #fff; }
+    .container { max-width: 600px; margin: 40px auto; background: #2c2f33; border-radius: 8px; padding: 24px; }
+    .channel { font-size: 1.3em; margin-bottom: 16px; }
+    .members { display: flex; flex-wrap: wrap; gap: 12px; }
+    .member { background: #36393f; border-radius: 6px; padding: 10px 16px; display: flex; align-items: center; }
+    .member img { width: 32px; height: 32px; border-radius: 50%; margin-right: 10px; }
+  </style>
+</head>
+<body>
+  <div id="connect-overlay" style="position:fixed;top:0;left:0;width:100vw;height:100vh;background:rgba(30,30,30,0.98);z-index:1000;display:flex;align-items:center;justify-content:center;flex-direction:column;">
+    <h2>Connect to Audio</h2>
+    <p>Click the button below to allow the website to play audio from Discord.</p>
+    <button id="connect-btn" style="font-size:1.2em;padding:0.7em 2em;border-radius:8px;background:#5865f2;color:#fff;border:none;cursor:pointer;">Connect</button>
+  </div>
+  <div class="container" id="main-content" style="filter:blur(2px);pointer-events:none;">
+  <div class="channel" id="channel">Loading...</div>
+  <div class="members" id="members"></div>
+  <div id="transcript" style="margin-top:24px;background:#23272a;padding:12px 16px;border-radius:8px;min-height:48px;max-height:200px;overflow-y:auto;font-size:1.05em;"></div>
+  <div id="audio-streams"></div>
+  </div>
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="/audio.js"></script>
+  <script>
+    document.getElementById('connect-btn').onclick = function() {
+      document.getElementById('connect-overlay').style.display = 'none';
+      document.getElementById('main-content').style.filter = '';
+      document.getElementById('main-content').style.pointerEvents = '';
+      // Resume audio context if needed
+      if (window.audioCtx && window.audioCtx.state === 'suspended') {
+        window.audioCtx.resume();
+      }
+    };
+  </script>
+</body>
+</html>
