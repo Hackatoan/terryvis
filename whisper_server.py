@@ -8,6 +8,13 @@ import soundfile as sf
 
 import threading
 import queue
+
+# Optionally load environment from a .env file if python-dotenv is installed
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
 try:
     import webrtcvad  # not used now, but kept for optional future use
     HAS_WEBRTCVAD = True
@@ -131,5 +138,20 @@ def transcribe():
             return jsonify({"error": f"Server response timed out after {JOB_TIMEOUT+5}s"}), 504
         return jsonify(response['data']), status[0]
 
+# Accept POST / as alias to /transcribe to avoid 404s from clients posting to root
+@app.route('/', methods=['POST'])
+def root_post():
+    return transcribe()
+
+# Basic health/info endpoint at GET /
+@app.route('/', methods=['GET'])
+def root_get():
+    return jsonify({
+        "ok": True,
+        "endpoint": "/transcribe",
+        "model": WHISPER_MODEL
+    }), 200
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5005)
+
