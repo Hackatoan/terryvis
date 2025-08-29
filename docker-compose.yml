@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  whisper:
+    build:
+      context: .
+      dockerfile: Dockerfile.whisper
+    environment:
+      - WHISPER_MODEL=${WHISPER_MODEL:-tiny.en}
+    ports:
+      - "5005:5005"
+
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - whisper
+    environment:
+      - DISCORD_TOKEN=${DISCORD_TOKEN}
+      - CLIPS_CHANNEL_ID=${CLIPS_CHANNEL_ID}
+      - PORT=${PORT:-3000}
+  - WHISPER_URL=${WHISPER_URL:-http://whisper:5005}
+    ports:
+      - "3000:3000"
+    # Mount clips folder for persistence if desired
+    volumes:
+      - ./public/clips:/app/public/clips

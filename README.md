@@ -38,7 +38,7 @@ Copy `.env.example` to `.env` and fill in at least `DISCORD_TOKEN`.
 Optional variables:
 - `CLIPS_CHANNEL_ID` (default target unless set via `-setclip`)
 - `PORT` (web UI, default 3000)
-- `WHISPER_URL` (defaults to http://localhost:5005/transcribe)
+- `WHISPER_URL` (defaults to http://127.0.0.1:5005; server also accepts `/transcribe`)
 - `WHISPER_MODEL` (for the Python server; default tiny.en)
 
 4. Python deps
@@ -85,6 +85,26 @@ npm start
 - The Python server enforces a small noise gate and a job timeout; see `whisper_server.py` constants.
 
 ## Troubleshooting
+## Docker
+
+Run both services with Docker:
+
+1. Create a `.env` in the project root with at least `DISCORD_TOKEN`.
+  - Optional: `CLIPS_CHANNEL_ID`, `PORT` (for web UI), `WHISPER_URL`, `WHISPER_MODEL`.
+  - When using Docker Compose, `WHISPER_URL` defaults to `http://whisper:5005`.
+
+2. Start with Compose:
+
+```bash
+docker compose up --build
+```
+
+Services:
+- whisper: Python Whisper server on port 5005 (exposed)
+- bot: Node bot + web UI on port 3000 (exposed)
+
+The clips folder is mounted at `./public/clips` for persistence.
+
 - If you see 404s on the Whisper server, ensure the bot `WHISPER_URL` points to `/transcribe` or use the root alias (`/`).
 - Ensure your bot token is correct and that the bot is not blocked by server permissions.
 - For better transcription quality, try `WHISPER_MODEL=base.en` (or higher) and ensure CPU resources are sufficient.

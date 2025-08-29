@@ -19,8 +19,8 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-// Optional env config
-const WHISPER_URL = process.env.WHISPER_URL || 'http://localhost:5005/transcribe';
+// Optional env config (defaults to simple IP; POST / is accepted by the server)
+const WHISPER_URL = process.env.WHISPER_URL || 'http://127.0.0.1:5005';
 
 // Discord client setup
 const client = new Client({

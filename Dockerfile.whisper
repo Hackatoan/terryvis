@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install system deps for soundfile
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libsndfile1 \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY whisper_server.py .
+
+ENV WHISPER_MODEL=tiny.en
+EXPOSE 5005
+
+CMD ["python", "whisper_server.py"]
