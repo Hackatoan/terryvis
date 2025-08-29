@@ -15,8 +15,10 @@ except Exception:
     HAS_WEBRTCVAD = False
 
 app = Flask(__name__)
-# Use an English model; prefer base.en for speed. If quality remains poor, try "small.en".
-model = whisper.load_model("tiny.en")
+# Select model from env; defaults to tiny.en. Consider base.en or small.en for better quality.
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "tiny.en")
+print(f"[WHISPER] Loading model: {WHISPER_MODEL}")
+model = whisper.load_model(WHISPER_MODEL)
 
 # Simple in-memory queue for transcription jobs
 MAX_QUEUE_SIZE = 6

@@ -19,6 +19,9 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
+// Optional env config
+const WHISPER_URL = process.env.WHISPER_URL || 'http://localhost:5005/transcribe';
+
 // Discord client setup
 const client = new Client({
   intents: [
@@ -483,7 +486,7 @@ function joinAndMonitor(channel) {
               member.whisperPcmBuffer = member.whisperPcmBuffer.slice(MIN_CHUNK_SAMPLES_STEREO);
               const audioBuffer = Buffer.from(chunk16k.buffer);
               member.transcribeQueue = member.transcribeQueue.then(() =>
-                axios.post('http://localhost:5005/transcribe', audioBuffer, {
+                axios.post(WHISPER_URL, audioBuffer, {
                   headers: { 'Content-Type': 'application/octet-stream' },
                   timeout: 20000
                 }).then(res => {
@@ -514,7 +517,7 @@ function joinAndMonitor(channel) {
                 member.whisperPcmBuffer = [];
                 const audioBuffer = Buffer.from(chunk16k.buffer);
                 member.transcribeQueue = member.transcribeQueue.then(() =>
-                  axios.post('http://localhost:5005/transcribe', audioBuffer, {
+                  axios.post(WHISPER_URL, audioBuffer, {
                     headers: { 'Content-Type': 'application/octet-stream' },
                     timeout: 20000
                   }).then(res => {
