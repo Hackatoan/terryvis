@@ -6,10 +6,9 @@ const { Client, GatewayIntentBits } = require('discord.js');
 const { joinVoiceChannel, EndBehaviorType } = require('@discordjs/voice');
 const fs = require('fs');
 const path = require('path');
-const { Readable } = require('stream');
 const wav = require('wav');
 const axios = require('axios');
-const { OpusEncoder } = require('@discordjs/opus');
+const prism = require('prism-media');
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
@@ -72,11 +71,106 @@ const CLIP_SECONDS = 30;
 const CLIP_SAMPLE_RATE = 48000;
 const CLIP_CHANNELS = 2;
 const CLIP_BYTES_PER_SAMPLE = 2; // 16-bit PCM
-const CLIP_BUFFER_SIZE = CLIP_SAMPLE_RATE * CLIP_CHANNELS * CLIP_BYTES_PER_SAMPLE * CLIP_SECONDS;
-let rollingPcmBuffer = Buffer.alloc(0); // legacy, not used by new ring-mix path
 let lastClipInfo = null; // { filename, username, timestamp }
 // Require users to be in a channel this long before we consider joining (ms)
 const MIN_STABLE_MS = 3000;
+// Mix gain for channel-wide accumulation (leave at 1.0; export normalizes if clipping)
+const MIX_ATTENUATION = 1.0;
+// (No edge smoothing; keep pipeline simple for maximum fidelity)
+
+// --- Channel-wide mixed ring buffer (represents actual timeline of the channel) ---
+const CHANNEL_RING_LENGTH = CLIP_SAMPLE_RATE * CLIP_CHANNELS * CLIP_SECONDS; // stereo Int16 samples count
+let channelRing = new Int32Array(CHANNEL_RING_LENGTH); // accumulate in 32-bit to avoid clipping during mix
+let channelWriteIndex = 0; // next position for newest time
+let channelClock = null;
+// Track per-user last write position for continuity
+const userMixState = new Map(); // userId -> lastIdx (position after last written sample)
+
+function startChannelTimeline() {
+  if (channelClock) clearInterval(channelClock);
+  channelRing = new Int32Array(CHANNEL_RING_LENGTH);
+  channelWriteIndex = 0;
+  userMixState.clear();
+  const sps = CLIP_SAMPLE_RATE * CLIP_CHANNELS;
+  const TICK_MS = 20; // align with typical Opus frame duration to reduce boundary artifacts
+  const SAMPLES_PER_TICK = Math.floor((sps * TICK_MS) / 1000);
+  channelClock = setInterval(() => {
+    for (let i = 0; i < SAMPLES_PER_TICK; i++) {
+      channelRing[channelWriteIndex] = 0;
+      channelWriteIndex++;
+      if (channelWriteIndex >= CHANNEL_RING_LENGTH) channelWriteIndex = 0;
+    }
+  }, TICK_MS);
+}
+
+function stopChannelTimeline() {
+  if (channelClock) {
+    clearInterval(channelClock);
+    channelClock = null;
+  }
+}
+
+// Overlay a decoded Int16Array pcm chunk so that its end aligns with the current time
+function mixUserIntoChannelRing(userId, pcmInt16) {
+  if (!pcmInt16 || pcmInt16.length === 0) return;
+  // Determine a start index that is continuous for this user but never in the future
+  let start;
+  const len = CHANNEL_RING_LENGTH;
+  if (userMixState.has(userId)) {
+    start = userMixState.get(userId);
+    // If start is too far ahead of channelWriteIndex (i.e., writing into the future), realign to end
+    const forward = start <= channelWriteIndex ? (channelWriteIndex - start) : (len - start + channelWriteIndex);
+    if (forward > pcmInt16.length) {
+      // The user's next chunk would land too far in the past; keep continuity
+    } else {
+      // Would write into the future; re-align chunk end with current time
+      start = channelWriteIndex - pcmInt16.length;
+      while (start < 0) start += len;
+    }
+  } else {
+    // First chunk for user: align end with current time
+    start = channelWriteIndex - pcmInt16.length;
+    while (start < 0) start += len;
+  }
+  let idx = start;
+  for (let p = 0; p < pcmInt16.length; p++) {
+    if (idx >= len) idx = 0;
+    channelRing[idx] = channelRing[idx] + (pcmInt16[p] * MIX_ATTENUATION);
+    idx++;
+  }
+  userMixState.set(userId, idx >= len ? 0 : idx);
+}
+
+function getLast30sChannelMix() {
+  const tmp = new Int32Array(CHANNEL_RING_LENGTH);
+  const firstPart = CHANNEL_RING_LENGTH - channelWriteIndex;
+  tmp.set(channelRing.subarray(channelWriteIndex), 0);
+  if (channelWriteIndex > 0) tmp.set(channelRing.subarray(0, channelWriteIndex), firstPart);
+  // Peak detect for optional normalization
+  let peak = 0;
+  for (let i = 0; i < tmp.length; i++) {
+    const v = Math.abs(tmp[i] | 0);
+    if (v > peak) peak = v;
+  }
+  const target = 31000; // small headroom under 32767
+  const scale = peak > 32767 ? (target / peak) : 1;
+  const out = new Int16Array(CHANNEL_RING_LENGTH);
+  if (scale !== 1) {
+    for (let i = 0; i < tmp.length; i++) {
+      let v = Math.round(tmp[i] * scale);
+      if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+      out[i] = v;
+    }
+  } else {
+    for (let i = 0; i < tmp.length; i++) {
+      let v = tmp[i];
+      if (v > 32767) v = 32767; else if (v < -32768) v = -32768;
+      out[i] = v;
+    }
+  }
+  return out;
+}
+ 
 
 // Per-user rolling ring buffers for 30s of 48kHz stereo Int16 PCM
 const TOTAL_CLIP_SAMPLES = CLIP_SAMPLE_RATE * CLIP_CHANNELS * CLIP_SECONDS; // Int16 samples (not bytes)
@@ -102,57 +196,6 @@ function writeToUserRing(userId, pcm16Stereo) {
   ring.lastWriteTimeMs = Date.now();
 }
 
-function getLast30sMix(memberIds) {
-  const total = new Int16Array(TOTAL_CLIP_SAMPLES); // zero-initialized
-  for (const userId of memberIds) {
-    const ring = userRings.get(userId);
-    if (!ring) continue;
-    const buf = ring.buffer;
-    const validLen = Math.min(TOTAL_CLIP_SAMPLES, ring.filled || 0);
-    if (validLen <= 0) continue;
-    // Compute where this user's latest sample should land relative to now, based on wall-clock
-    const nowMs = Date.now();
-    const sr = CLIP_SAMPLE_RATE * CLIP_CHANNELS; // samples per second (stereo)
-    const sinceMs = Math.max(0, nowMs - (ring.lastWriteTimeMs || nowMs));
-    let offsetSamples = Math.floor((sinceMs / 1000) * sr);
-    if (offsetSamples < 0) offsetSamples = 0;
-    if (offsetSamples > TOTAL_CLIP_SAMPLES) offsetSamples = TOTAL_CLIP_SAMPLES;
-
-    // Source window in ring (oldest -> newest)
-    let srcStart = ring.writeIndex - validLen;
-    if (srcStart < 0) srcStart += buf.length;
-    // Desired destination end index (exclusive)
-    let dstEnd = TOTAL_CLIP_SAMPLES - offsetSamples;
-    if (dstEnd <= 0) continue; // all content is outside the 30s window
-    let dstStart = dstEnd - validLen;
-    let copyLen = validLen;
-    // If the start is before 0, trim the leading part from the source
-    if (dstStart < 0) {
-      const drop = -dstStart;
-      // advance srcStart by 'drop' samples with wrap
-      srcStart += drop;
-      if (srcStart >= buf.length) srcStart -= buf.length * Math.floor(srcStart / buf.length);
-      copyLen -= drop;
-      dstStart = 0;
-      if (copyLen <= 0) continue;
-    }
-    // Also trim if the end would exceed the buffer
-    if (dstStart + copyLen > TOTAL_CLIP_SAMPLES) {
-      copyLen = TOTAL_CLIP_SAMPLES - dstStart;
-      if (copyLen <= 0) continue;
-    }
-    // Copy and mix
-    let p = srcStart;
-    for (let i = 0; i < copyLen; i++) {
-      if (p >= buf.length) p = 0;
-      const dstIdx = dstStart + i;
-      const sum = total[dstIdx] + buf[p];
-      total[dstIdx] = sum > 32767 ? 32767 : (sum < -32768 ? -32768 : sum);
-      p++;
-    }
-  }
-  return total;
-}
 
 // Create and send a 30s clip of the current voice channel mix
 async function handleVoiceClipCommand(requestedByName, requestedById) {
@@ -169,7 +212,8 @@ async function handleVoiceClipCommand(requestedByName, requestedById) {
       .filter(([uid, ring]) => uid !== botId && ring && ring.filled > 0 && (now - (ring.lastWriteTimeMs || 0)) <= cutoff)
       .map(([uid]) => uid);
     if (memberIds.length === 0) return;
-    const mixed = getLast30sMix(memberIds);
+  // Use the channel-wide mixed ring to get the real last 30s of the room
+  const mixed = getLast30sChannelMix();
     // Ensure output directory exists
     const clipsDir = path.join(__dirname, 'public', 'clips');
     if (!fs.existsSync(clipsDir)) fs.mkdirSync(clipsDir, { recursive: true });
@@ -185,7 +229,7 @@ async function handleVoiceClipCommand(requestedByName, requestedById) {
       out.on('error', reject);
       out.on('finish', resolve);
       writer.pipe(out);
-      writer.write(Buffer.from(mixed.buffer));
+  writer.write(Buffer.from(mixed.buffer, mixed.byteOffset, mixed.byteLength));
       writer.end();
     });
 
@@ -411,6 +455,8 @@ function leaveVoiceChannel(reason = '') {
       clearInterval(monitorInterval);
       monitorInterval = null;
     }
+  stopChannelTimeline();
+  userMixState.clear();
     if (currentConnection) {
       try { currentConnection.destroy(); } catch (_) {}
       currentConnection = null;
@@ -428,6 +474,8 @@ function joinAndMonitor(channel) {
     guildId: channel.guild.id,
     adapterCreator: channel.guild.voiceAdapterCreator
   });
+  // Start channel timeline for mixed ring
+  startChannelTimeline();
   // Handle receiver-level errors (e.g., DAVE decryption hiccups)
   try {
     currentConnection.receiver.on('error', (err) => {
@@ -461,22 +509,23 @@ function joinAndMonitor(channel) {
             duration: 1000
           }
         });
-  // The Discord audio is actually 128kHz stereo, but Discord.js/Opus gives us 48kHz stereo.
-  // We'll send as-is, but update the server to expect 48kHz if needed, or upsample here if required.
-  const decoder = new OpusEncoder(48000, 2); // 48kHz, stereo
+        // Decode Opus to PCM S16LE using prism-media (robust, smoother timing)
+        const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
+        opusStream.pipe(decoder);
         const userName = member.user.username;
-        opusStream.on('data', (chunk) => {
+        decoder.on('data', (pcm) => {
           try {
-            const pcm = decoder.decode(chunk);
             // Send PCM as base64 to browser
             io.emit('audio', {
               userId,
               data: Buffer.from(pcm).toString('base64')
             });
-            // --- New: Accumulate PCM, downsample to 16kHz mono, send as soon as enough is buffered ---
+            // --- Accumulate PCM, downsample to 16kHz mono, send as soon as enough is buffered ---
             if (!member.whisperPcmBuffer) member.whisperPcmBuffer = [];
             // Convert to Int16Array
             const pcm16 = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
+            // Also mix into the channel-wide ring with per-user continuity to preserve natural speech
+            mixUserIntoChannelRing(userId, pcm16);
             // Write decoded 48kHz stereo PCM into the user's 30s ring buffer for clipping
             writeToUserRing(userId, pcm16);
             member.whisperPcmBuffer.push(...pcm16);
@@ -580,19 +629,18 @@ function joinAndMonitor(channel) {
               member.lastWhisperSend = Date.now();
             }
           } catch (e) {
-            // Ignore decode errors
+            // Skip bad frames to avoid static artifacts
           }
         });
 
-        opusStream.on('end', () => {
+        decoder.on('end', () => {
           activeStreams.delete(userId);
         });
-        opusStream.on('error', (err) => {
-          // Common transient: DAVE decryption failure; ignore and clean up
-          console.warn(`[audio stream error] user ${userId}:`, err && err.code ? err.code : String(err));
+        decoder.on('error', () => {
+          // Skip decoder errors
           activeStreams.delete(userId);
-          try { member.whisperPcmBuffer = []; } catch (_) {}
         });
+  // No additional per-stream error handlers to keep audio path identical to prior version
       }
     }
   }, 2000); // Check every 2 seconds for new users
