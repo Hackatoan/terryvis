@@ -1,12 +1,116 @@
-const socket = io();
-// Live transcript UI
+// Robust socket with auto-reconnect
+const socket = io({ transports: ['websocket'], reconnection: true, reconnectionDelay: 500, reconnectionAttempts: Infinity });
+
+// Live transcript UI with backfill
 const transcriptDiv = document.getElementById('transcript');
 let transcriptLines = [];
-socket.on('transcript', ({ userId, username, text }) => {
-  transcriptLines.push(`<b>${username}:</b> ${text}`);
-  if (transcriptLines.length > 30) transcriptLines.shift();
+function renderTranscript() {
   transcriptDiv.innerHTML = transcriptLines.join('<br>');
   transcriptDiv.scrollTop = transcriptDiv.scrollHeight;
+}
+socket.on('transcript', ({ userId, username, text, timestamp }) => {
+  transcriptLines.push(`<b>${username || 'User'}:</b> ${text}`);
+  if (transcriptLines.length > 100) transcriptLines.shift();
+  renderTranscript();
+});
+socket.on('transcripts_recent', (items) => {
+  if (!Array.isArray(items)) return;
+  // Sort by timestamp ascending and render last ~100
+  items.sort((a,b) => (a.timestamp||0)-(b.timestamp||0));
+  transcriptLines = items.slice(-100).map(({ username, text }) => `<b>${username || 'User'}:</b> ${text}`);
+  renderTranscript();
+});
+
+// Clips list with Discord URLs, sorted newest first
+const clipsDiv = document.getElementById('clips');
+let clipItems = [];
+function renderClips() {
+  const sorted = clipItems.slice().sort((a,b) => (b.timestamp||0)-(a.timestamp||0));
+  clipsDiv.innerHTML = sorted.map(c => {
+    const d = new Date(c.timestamp||Date.now());
+    const when = d.toLocaleString();
+    const urlEsc = c.url.replace(/"/g, '&quot;');
+    return `<div class="clip-item" style="margin:10px 0;display:flex;flex-direction:column;gap:6px;">`+
+      `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">`+
+        `<a href="${urlEsc}" target="_blank" rel="noopener" style="color:#58a6ff;">Clip (${when})</a>`+
+        `<button class="copy-btn" data-url="${urlEsc}" style="padding:2px 8px;border-radius:6px;background:#3a3f44;color:#fff;border:1px solid #555;cursor:pointer;">Copy</button>`+
+        (c.username ? ` <span style="opacity:0.7">by ${c.username}</span>` : '')+
+      `</div>`+
+      `<audio controls preload="none" controlslist="nodownload noplaybackrate" style="width:100%;max-width:560px;outline:none;">`+
+        `<source src="${urlEsc}" type="audio/wav">`+
+        `Your browser does not support the audio element.`+
+      `</audio>`+
+    `</div>`;
+  }).join('');
+}
+socket.on('clips_recent', (items) => {
+  if (!Array.isArray(items)) return;
+  clipItems = items;
+  renderClips();
+});
+socket.on('clip_posted', (clip) => {
+  if (!clip || !clip.url) return;
+  clipItems.push(clip);
+  if (clipItems.length > 200) clipItems.shift();
+  renderClips();
+});
+
+// Copy button handling (event delegation)
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('.copy-btn');
+  if (!btn) return;
+  const url = btn.getAttribute('data-url');
+  try {
+    await navigator.clipboard.writeText(url);
+    showToast('Link copied');
+  } catch (_) {
+    // Fallback: create a temp input
+    const inp = document.createElement('input');
+    inp.value = url;
+    document.body.appendChild(inp);
+    inp.select();
+    document.execCommand('copy');
+    document.body.removeChild(inp);
+    showToast('Link copied');
+  }
+});
+
+// Simple toast
+let toastEl;
+function ensureToast() {
+  if (toastEl) return toastEl;
+  toastEl = document.createElement('div');
+  toastEl.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:#111;color:#fff;padding:8px 14px;border-radius:8px;opacity:0;transition:opacity .2s;z-index:2000;border:1px solid #333';
+  document.body.appendChild(toastEl);
+  return toastEl;
+}
+function showToast(msg) {
+  const el = ensureToast();
+  el.textContent = msg || '';
+  el.style.opacity = '1';
+  setTimeout(() => { el.style.opacity = '0'; }, 1200);
+}
+
+// Wire up Clip button to request a server-side clip
+document.addEventListener('DOMContentLoaded', () => {
+  const btn = document.getElementById('clip-btn');
+  if (btn) {
+    btn.addEventListener('click', () => {
+      try {
+        socket.emit('clip_request', {});
+        showToast('Clipping last 30s...');
+      } catch (_) {}
+    });
+  }
+});
+
+// Connection lifecycle handling
+socket.on('connect_error', () => {
+  // force reconnect
+  try { socket.connect(); } catch (e){}
+});
+socket.on('reconnect_attempt', () => {
+  // NOP: rely on built-in backoff
 });
 // This is a placeholder for browser-side Opus decoding and playback.
 // In production, you would use a library like opus-recorder, or a WASM Opus decoder.

@@ -34,6 +34,9 @@ const client = new Client({
 });
 
 let monitorInterval;
+// Buffers for web backfill/sync
+const recentTranscripts = []; // { userId, username, text, timestamp }
+const recentClips = []; // { url, username, timestamp }
 
 // --- Persistent config for clip channel and DM preferences ---
 const CONFIG_PATH = path.join(__dirname, 'clips-config.json');
@@ -293,8 +296,7 @@ async function handleVoiceClipCommand(requestedByName, requestedById) {
       writer.end();
     });
 
-    lastClipInfo = { filename: path.basename(filePath), username: requestedByName, timestamp: Date.now() };
-    io.emit('new_clip', lastClipInfo);
+  lastClipInfo = { filename: path.basename(filePath), username: requestedByName, timestamp: Date.now() };
 
     let delivered = false;
     // If the user has DM toggle enabled, try to send the clip to their DMs
@@ -302,7 +304,17 @@ async function handleVoiceClipCommand(requestedByName, requestedById) {
     if (dmOn) {
       try {
         const user = await client.users.fetch(requestedById);
-        await user.send({ content: `Here is your clip, ${requestedByName}`, files: [filePath] });
+        const msg = await user.send({ content: `Here is your clip, ${requestedByName}`, files: [filePath] });
+        let att = null;
+        try { att = msg.attachments && typeof msg.attachments.first === 'function' ? msg.attachments.first() : null; } catch (_) {}
+        if (!att) {
+          try {
+            const it = msg.attachments?.values?.();
+            const nxt = it && it.next ? it.next() : { done: true };
+            if (nxt && !nxt.done) att = nxt.value;
+          } catch (_) {}
+        }
+        if (att && att.url) deliveredUrl = att.url;
         delivered = true;
       } catch (_) { /* fall through to channel post if DM fails */ }
     }
@@ -314,7 +326,17 @@ async function handleVoiceClipCommand(requestedByName, requestedById) {
       const clipsText = clipChannelId ? guild.channels.cache.get(clipChannelId) : null;
       if (clipsText && typeof clipsText.isTextBased === 'function' && clipsText.isTextBased()) {
         try {
-          await clipsText.send({ content: `Clip requested by ${requestedByName}` , files: [filePath] });
+          const msg = await clipsText.send({ content: `Clip requested by ${requestedByName}` , files: [filePath] });
+          let att = null;
+          try { att = msg.attachments && typeof msg.attachments.first === 'function' ? msg.attachments.first() : null; } catch (_) {}
+          if (!att) {
+            try {
+              const it = msg.attachments?.values?.();
+              const nxt = it && it.next ? it.next() : { done: true };
+              if (nxt && !nxt.done) att = nxt.value;
+            } catch (_) {}
+          }
+          if (att && att.url) deliveredUrl = att.url;
           delivered = true;
         } catch (_) { /* ignore send errors */ }
       }
@@ -323,6 +345,14 @@ async function handleVoiceClipCommand(requestedByName, requestedById) {
     // Delete the local file after successful delivery
     if (delivered) {
       try { await fs.promises.unlink(filePath); } catch (_) {}
+    }
+
+    // If we have a URL for the posted clip, broadcast and remember it for the web UI
+    if (deliveredUrl) {
+      const clipInfo = { url: deliveredUrl, username: requestedByName, timestamp: Date.now() };
+      recentClips.push(clipInfo);
+      if (recentClips.length > 100) recentClips.shift();
+      io.emit('clip_posted', clipInfo);
     }
   } catch (_) {
     // ignore errors; clipping is best-effort
@@ -355,6 +385,14 @@ function appendTranscriptContext(userId, text) {
   const cutoff = now - 6000;
   while (arr.length && arr[0].t < cutoff) arr.shift();
   transcriptHistoryByUser.set(userId, arr);
+  // Track recent transcripts for UI backfill
+  const name = (currentMembers.find(m => m.id === userId)?.username) || '';
+  recentTranscripts.push({ userId, username: name, text: String(text || ''), timestamp: now });
+  // Keep at most 200 and prune anything older than ~30 minutes as a safety
+  const staleCutoff = now - (30 * 60 * 1000);
+  while (recentTranscripts.length > 200 || (recentTranscripts[0] && recentTranscripts[0].timestamp < staleCutoff)) {
+    recentTranscripts.shift();
+  }
 }
 
 function getContextText(userId) {
@@ -682,6 +720,25 @@ io.on('connection', (socket) => {
   socket.emit('update', {
     channel: channelObj,
     members: currentMembers
+  });
+  // Backfill recent events
+  try {
+    socket.emit('transcripts_recent', recentTranscripts.slice(-100));
+    const sortedClips = recentClips.slice().sort((a,b) => b.timestamp - a.timestamp);
+    socket.emit('clips_recent', sortedClips);
+  } catch (_) {}
+
+  // Clip button: throttle requests per socket to avoid spam
+  let lastClipReq = 0;
+  socket.on('clip_request', async () => {
+    const now = Date.now();
+    if (now - lastClipReq < 5000) return; // 5s cooldown per client
+    lastClipReq = now;
+    try {
+      const botName = client.user?.username || 'Bot';
+      const botId = client.user?.id || '0';
+      await handleVoiceClipCommand(botName, botId);
+    } catch (_) {}
   });
 });
 
