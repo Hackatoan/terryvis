@@ -30,9 +30,11 @@ function renderClips() {
     const d = new Date(c.timestamp||Date.now());
     const when = d.toLocaleString();
     const urlEsc = c.url.replace(/"/g, '&quot;');
+    const title = (c.title && String(c.title).trim()) ? String(c.title).trim() : '';
+    const label = title ? `Clip: "${title}" (${when})` : `Clip (${when})`;
     return `<div class="clip-item" style="margin:10px 0;display:flex;flex-direction:column;gap:6px;">`+
       `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">`+
-        `<a href="${urlEsc}" target="_blank" rel="noopener" style="color:#58a6ff;">Clip (${when})</a>`+
+        `<a href="${urlEsc}" target="_blank" rel="noopener" style="color:#58a6ff;">${label}</a>`+
         `<button class="copy-btn" data-url="${urlEsc}" style="padding:2px 8px;border-radius:6px;background:#3a3f44;color:#fff;border:1px solid #555;cursor:pointer;">Copy</button>`+
         (c.username ? ` <span style="opacity:0.7">by ${c.username}</span>` : '')+
       `</div>`+
@@ -97,11 +99,69 @@ document.addEventListener('DOMContentLoaded', () => {
   if (btn) {
     btn.addEventListener('click', () => {
       try {
-        socket.emit('clip_request', {});
+        const title = prompt('Optional title for this clip? (Leave blank for default)') || '';
+        socket.emit('clip_request', { title });
         showToast('Clipping last 30s...');
       } catch (_) {}
     });
   }
+});
+
+// --- Play audio into Discord (client provides URL) ---
+document.addEventListener('DOMContentLoaded', () => {
+  const fileInput = document.getElementById('file-input');
+  const dropZone = document.getElementById('drop-zone');
+  const playBtn = document.getElementById('play-btn');
+  const status = document.getElementById('play-status');
+  let objectUrl = '';
+
+  function setStatus(msg) { if (status) status.textContent = msg || ''; }
+
+  function setFile(file) {
+    if (!file) return;
+    try { if (objectUrl) URL.revokeObjectURL(objectUrl); } catch (_) {}
+    objectUrl = URL.createObjectURL(file);
+    setStatus(`Selected: ${file.name} (${Math.round(file.size/1024)} KB)`);
+  }
+
+  if (fileInput) {
+    fileInput.addEventListener('change', (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (f) setFile(f);
+    });
+  }
+  if (dropZone) {
+    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.style.borderColor = '#5865f2'; });
+    dropZone.addEventListener('dragleave', () => { dropZone.style.borderColor = '#3a3f44'; });
+    dropZone.addEventListener('drop', (e) => {
+      e.preventDefault(); dropZone.style.borderColor = '#3a3f44';
+      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+      if (f) setFile(f);
+    });
+  }
+  if (playBtn) {
+    playBtn.addEventListener('click', async () => {
+      const f = (fileInput && fileInput.files && fileInput.files[0]) || null;
+      if (!f) { setStatus('Please select a file first.'); return; }
+      // Ensure AudioContext is resumed (user gesture) to avoid autoplay restrictions errors
+      try { if (audioCtx && audioCtx.state === 'suspended') await audioCtx.resume(); } catch (_) {}
+      try {
+        const arrBuf = await f.arrayBuffer();
+  // Emit as binary with mime and original filename
+  socket.emit('play_upload', { data: new Uint8Array(arrBuf), mime: f.type || 'application/octet-stream', name: f.name || 'upload' });
+        setStatus('Playing...');
+      } catch (e) { setStatus('Failed to send play request.'); }
+    });
+  }
+  // Listen for server status of playback
+  socket.on('play_started', () => setStatus('Playing in Discord...'));
+  socket.on('play_ended', () => setStatus('Playback finished.'));
+  socket.on('play_error', (msg) => setStatus(`Playback error: ${msg || ''}`));
+  socket.on('play_saved', ({ url, name }) => {
+    if (!url) return;
+    const safe = String(url).replace(/"/g, '&quot;');
+    setStatus(`Saved on server: <a href="${safe}" target="_blank" rel="noopener">${name || safe}</a>`);
+  });
 });
 
 // Connection lifecycle handling

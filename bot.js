@@ -3,9 +3,10 @@
 // --- Imports and Setup ---
 require('dotenv').config();
 const { Client, GatewayIntentBits } = require('discord.js');
-const { joinVoiceChannel, EndBehaviorType } = require('@discordjs/voice');
+const { joinVoiceChannel, EndBehaviorType, createAudioPlayer, createAudioResource, NoSubscriberBehavior, StreamType, AudioPlayerStatus, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 const { Readable } = require('stream');
 const wav = require('wav');
 const axios = require('axios');
@@ -22,15 +23,93 @@ const io = new Server(server);
 // Optional env config
 const WHISPER_URL = process.env.WHISPER_URL || 'http://localhost:5005/transcribe';
 
+// Helper: coerce various binary forms into a Node Buffer
+function toNodeBuffer(data) {
+  try {
+    if (!data) return null;
+    if (Buffer.isBuffer(data)) return data;
+    // Browser sent Uint8Array
+    if (data instanceof Uint8Array) {
+      return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+    }
+    // Raw ArrayBuffer
+    if (typeof ArrayBuffer !== 'undefined' && data instanceof ArrayBuffer) {
+      return Buffer.from(new Uint8Array(data));
+    }
+    // Socket.IO may JSONify Buffer as { type: 'Buffer', data: number[] }
+    if (data && Array.isArray(data.data)) {
+      return Buffer.from(data.data);
+    }
+    // As a last resort, try constructing from typed array-like
+    if (typeof data.length === 'number') {
+      return Buffer.from(data);
+    }
+  } catch (_) { /* ignore */ }
+  return null;
+}
+
+// Helper: play a file from disk into the current voice connection
+async function playFileFromDisk(filePath, onStart, onEnd, onError) {
+  try {
+    if (!currentConnection) throw new Error('No voice connection');
+    await entersState(currentConnection, VoiceConnectionStatus.Ready, 10000);
+    if (!currentPlayer) {
+      currentPlayer = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+      try { currentConnection.subscribe(currentPlayer); } catch (_) {}
+    }
+    console.log('[playFile] spawning ffmpeg for PCM decode (raw s16le):', filePath);
+    const ff = spawn('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-nostdin',
+      '-re', '-i', filePath,
+      '-vn', '-sn', '-dn',
+      '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    ff.stderr.on('data', d => {
+      const s = d.toString();
+      if (s.trim()) console.warn('[playFile][ffmpeg]', s.trim());
+    });
+    ff.on('close', (code, signal) => {
+      console.log('[playFile] ffmpeg exited code', code, 'signal', signal);
+      if (typeof code === 'number' && code !== 0) {
+        onError && onError(new Error('ffmpeg failed code ' + code));
+      }
+    });
+    const pcm = ff.stdout;
+    const enc = new prism.opus.Encoder({ rate: 48000, channels: 2, frameSize: 960 });
+    enc.on('error', (e) => { console.warn('[playFile] opus encoder error:', e?.message || e); onError && onError(e); });
+    const opus = pcm.pipe(enc);
+    const resource = createAudioResource(opus, { inputType: StreamType.Opus });
+    try { currentPlayer.stop(true); } catch (_) {}
+    // Wire events
+    const started = () => { onStart && onStart(); try { currentPlayer.off(AudioPlayerStatus.Playing, started); } catch (_) {} };
+    const ended = () => { onEnd && onEnd(); try { currentPlayer.off(AudioPlayerStatus.Idle, ended); } catch (_) {} };
+    try { currentPlayer.removeAllListeners(AudioPlayerStatus.Playing); } catch (_) {}
+    try { currentPlayer.removeAllListeners(AudioPlayerStatus.Idle); } catch (_) {}
+    currentPlayer.on(AudioPlayerStatus.Playing, started);
+    currentPlayer.on(AudioPlayerStatus.Idle, ended);
+    currentPlayer.on('error', (err) => { console.warn('[playFile] player error:', err?.message || err); onError && onError(err); });
+    currentPlayer.play(resource);
+  } catch (e) {
+    onError && onError(e);
+  }
+}
+
 // Discord client setup
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent
-  ]
+const enabledIntents = [
+  GatewayIntentBits.Guilds,
+  GatewayIntentBits.GuildVoiceStates,
+  GatewayIntentBits.GuildMembers,
+  GatewayIntentBits.GuildMessages,
+  GatewayIntentBits.MessageContent,
+];
+const client = new Client({ intents: enabledIntents });
+console.log('[init] Discord client starting with intents:', enabledIntents);
+client.once('ready', () => {
+  try {
+    console.log(`[init] Logged in as ${client.user?.tag || client.user?.id || 'unknown'}`);
+  } catch (_) {
+    console.log('[init] Logged in (user unknown)');
+  }
 });
 
 let monitorInterval;
@@ -71,11 +150,11 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 // --- Audio/Clip Buffering and State ---
 let currentChannelId = null;
 let currentConnection = null; // active voice connection, if any
+let currentPlayer = null; // audio player for playback
 const CLIP_SECONDS = 30;
 const CLIP_SAMPLE_RATE = 48000;
 const CLIP_CHANNELS = 2;
-const CLIP_BYTES_PER_SAMPLE = 2; // 16-bit PCM
-let lastClipInfo = null; // { filename, username, timestamp }
+// lastClipInfo no longer tracked
 // Require users to be in a channel this long before we consider joining (ms)
 const MIN_STABLE_MS = 3000;
 // Per-user rolling ring buffers for 30s of 48kHz stereo Int16 PCM
@@ -257,7 +336,17 @@ function normalizeToTargetRms(int16, target = 0.1, maxScale = 6.0) {
 
 
 // Create and send a 30s clip of the current voice channel mix
-async function handleVoiceClipCommand(requestedByName, requestedById) {
+function sanitizeClipTitle(raw) {
+  let s = String(raw || '').replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+  // Allow letters, numbers, spaces, dashes, underscores, and parentheses
+  s = s.replace(/[^a-zA-Z0-9 _\-()]/g, '');
+  if (!s) s = 'clip';
+  // Cap length
+  if (s.length > 60) s = s.slice(0, 60).trim();
+  return s;
+}
+
+async function handleVoiceClipCommand(requestedByName, requestedById, titleOptional) {
   try {
     const guild = client.guilds.cache.first();
     if (!guild || !currentChannelId) return;
@@ -283,6 +372,7 @@ async function handleVoiceClipCommand(requestedByName, requestedById) {
   // Unique filename to survive rapid successive clip requests
   const unique = `${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
   const filePath = path.join(clipsDir, `clip_${unique}.wav`);
+    const attachName = `${sanitizeClipTitle(titleOptional)}.wav`;
 
     // Write WAV using wav.Writer
     await new Promise((resolve, reject) => {
@@ -296,15 +386,13 @@ async function handleVoiceClipCommand(requestedByName, requestedById) {
       writer.end();
     });
 
-  lastClipInfo = { filename: path.basename(filePath), username: requestedByName, timestamp: Date.now() };
-
     let delivered = false;
     // If the user has DM toggle enabled, try to send the clip to their DMs
     const dmOn = !!config.dmPrefs[requestedById];
     if (dmOn) {
       try {
         const user = await client.users.fetch(requestedById);
-        const msg = await user.send({ content: `Here is your clip, ${requestedByName}`, files: [filePath] });
+  const msg = await user.send({ content: `Here is your clip, ${requestedByName}`, files: [{ attachment: filePath, name: attachName }] });
         let att = null;
         try { att = msg.attachments && typeof msg.attachments.first === 'function' ? msg.attachments.first() : null; } catch (_) {}
         if (!att) {
@@ -326,7 +414,7 @@ async function handleVoiceClipCommand(requestedByName, requestedById) {
       const clipsText = clipChannelId ? guild.channels.cache.get(clipChannelId) : null;
       if (clipsText && typeof clipsText.isTextBased === 'function' && clipsText.isTextBased()) {
         try {
-          const msg = await clipsText.send({ content: `Clip requested by ${requestedByName}` , files: [filePath] });
+          const msg = await clipsText.send({ content: `Clip requested by ${requestedByName}` , files: [{ attachment: filePath, name: attachName }] });
           let att = null;
           try { att = msg.attachments && typeof msg.attachments.first === 'function' ? msg.attachments.first() : null; } catch (_) {}
           if (!att) {
@@ -349,7 +437,7 @@ async function handleVoiceClipCommand(requestedByName, requestedById) {
 
     // If we have a URL for the posted clip, broadcast and remember it for the web UI
     if (deliveredUrl) {
-      const clipInfo = { url: deliveredUrl, username: requestedByName, timestamp: Date.now() };
+      const clipInfo = { url: deliveredUrl, username: requestedByName, timestamp: Date.now(), title: sanitizeClipTitle(titleOptional) };
       recentClips.push(clipInfo);
       if (recentClips.length > 100) recentClips.shift();
       io.emit('clip_posted', clipInfo);
@@ -549,12 +637,17 @@ function getMostPopulatedVoiceChannel(guild) {
 // --- Join a voice channel and monitor audio, transcribe, and handle clips ---
 function leaveVoiceChannel(reason = '') {
   try {
+    console.log('[voice] leaving voice channel', currentChannelId || '(none)', 'reason=', reason);
     if (monitorInterval) {
       clearInterval(monitorInterval);
       monitorInterval = null;
     }
+    if (currentPlayer) {
+      try { currentPlayer.stop(true); console.log('[voice] stopped currentPlayer'); } catch (e) { console.warn('[voice] currentPlayer.stop error:', e?.message); }
+      currentPlayer = null;
+    }
     if (currentConnection) {
-      try { currentConnection.destroy(); } catch (_) {}
+      try { currentConnection.destroy(); console.log('[voice] destroyed connection'); } catch (e) { console.warn('[voice] connection.destroy error:', e?.message); }
       currentConnection = null;
     }
     currentChannelId = null;
@@ -563,13 +656,35 @@ function leaveVoiceChannel(reason = '') {
 }
 
 function joinAndMonitor(channel) {
+  console.log('[voice] joining channel', channel?.id, channel?.name);
   currentChannelId = channel.id;
   updateWebMembers(channel);
   currentConnection = joinVoiceChannel({
     channelId: channel.id,
     guildId: channel.guild.id,
-    adapterCreator: channel.guild.voiceAdapterCreator
+    adapterCreator: channel.guild.voiceAdapterCreator,
+    selfDeaf: false,
+    selfMute: false
   });
+  try {
+    currentConnection.on('stateChange', (oldS, newS) => {
+      console.log('[voice] connection stateChange:', oldS?.status, '->', newS?.status);
+    });
+  } catch (_) {}
+  // Create or reuse an audio player for playback
+  if (!currentPlayer) {
+    currentPlayer = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+    try {
+      currentPlayer.on('stateChange', (o, n) => console.log('[voice] player stateChange:', o?.status, '->', n?.status));
+      currentPlayer.on('error', (e) => console.warn('[voice] player error:', e?.message || e));
+    } catch (_) {}
+  }
+  try { currentConnection.subscribe(currentPlayer); console.log('[voice] subscribed player to connection'); } catch (e) { console.warn('[voice] subscribe error:', e?.message); }
+
+  // Wait until ready before starting to receive/process
+  entersState(currentConnection, VoiceConnectionStatus.Ready, 15000)
+    .then(() => console.log('[voice] connection Ready'))
+    .catch((e) => console.warn('[voice] connection not ready:', e?.message || e));
 
   const receiver = currentConnection.receiver;
   const activeStreams = new Set();
@@ -707,6 +822,7 @@ app.use('/clips', express.static(path.join(__dirname, 'public', 'clips')));
 
 // --- Socket.io: Send current channel/members on connection ---
 io.on('connection', (socket) => {
+  console.log('[ws] client connected');
   let channelObj = null;
   if (currentChannelId) {
     const guild = client.guilds.cache.first();
@@ -730,15 +846,104 @@ io.on('connection', (socket) => {
 
   // Clip button: throttle requests per socket to avoid spam
   let lastClipReq = 0;
-  socket.on('clip_request', async () => {
+  socket.on('clip_request', async (payload) => {
     const now = Date.now();
     if (now - lastClipReq < 5000) return; // 5s cooldown per client
     lastClipReq = now;
     try {
       const botName = client.user?.username || 'Bot';
       const botId = client.user?.id || '0';
-      await handleVoiceClipCommand(botName, botId);
+      const title = payload && typeof payload.title === 'string' ? payload.title : '';
+      await handleVoiceClipCommand(botName, botId, title);
     } catch (_) {}
+  });
+
+  // Web-initiated playback: upload binary and stream into Discord via ffmpeg (prism-media)
+  let lastPlayReq = 0;
+  socket.on('play_upload', async (payload) => {
+    try {
+      const now = Date.now();
+      if (now - lastPlayReq < 3000) return; // cooldown 3s per client
+      lastPlayReq = now;
+      const dataLen = payload && payload.data && payload.data.length ? payload.data.length : 0;
+      const mime = payload && typeof payload.mime === 'string' ? payload.mime : 'unknown';
+      console.log(`[play] request received: bytes=${dataLen} mime=${mime}`);
+      if (!payload || !payload.data || typeof payload.mime !== 'string') {
+        console.warn('[play] invalid payload');
+        try { socket.emit('play_error', 'Invalid file payload'); } catch (_) {}
+        return;
+      }
+      if (!currentConnection) {
+        console.warn('[play] no currentConnection (bot not in voice channel)');
+        try { socket.emit('play_error', 'Bot is not in a voice channel'); } catch (_) {}
+        return;
+      }
+      // Ensure voice connection is Ready before playback
+      try {
+        await entersState(currentConnection, VoiceConnectionStatus.Ready, 10000);
+      } catch (e) {
+        console.warn('[play] connection not Ready:', e?.message || e);
+        try { socket.emit('play_error', 'Voice connection not ready'); } catch (_) {}
+        return;
+      }
+      if (!currentPlayer) {
+        currentPlayer = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+        console.log('[play] created AudioPlayer');
+        try { currentConnection.subscribe(currentPlayer); console.log('[play] subscribed player to connection'); } catch (e) { console.warn('[play] subscribe failed:', e?.message); }
+      }
+  const buf = toNodeBuffer(payload.data);
+  if (!buf || buf.length === 0) {
+    console.warn('[play] could not convert upload to buffer');
+    try { socket.emit('play_error', 'Failed to read uploaded bytes'); } catch (_) {}
+    return;
+  }
+  // Save upload to disk
+  const uploadsDir = path.join(__dirname, 'public', 'uploads');
+  try { if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true }); } catch (e) { console.warn('[play] mkdir uploads failed:', e?.message); }
+  const rawName = (payload && typeof payload.name === 'string') ? payload.name : 'upload';
+  const safeBase = String(rawName).replace(/[^a-zA-Z0-9._-]+/g, '_').slice(0, 80) || 'upload';
+  const unique = `${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+  const fileName = `${unique}_${safeBase}`;
+  const filePath = path.join(uploadsDir, fileName);
+  await fs.promises.writeFile(filePath, buf);
+      console.log('[play] saved upload to', filePath, 'size=', buf.length);
+      // Emit a URL so client can see where it landed
+      try {
+        const url = `/uploads/${fileName}`;
+        socket.emit('play_saved', { url, name: safeBase });
+      } catch (_) {}
+      // Play from disk using helper, emit events, then delete file
+      playFileFromDisk(
+        filePath,
+        () => { try { socket.emit('play_started'); } catch (_) {} },
+        () => {
+          try { socket.emit('play_ended'); } catch (_) {}
+          if (process.env.KEEP_UPLOADS === '1') {
+            console.log('[play] KEEP_UPLOADS=1 set; skipping delete after end for', filePath);
+          } else {
+            fs.unlink(filePath, (err) => {
+              if (err) console.warn('[play] failed to delete after end:', err?.message || err);
+              else console.log('[play] deleted upload file after end', filePath);
+            });
+          }
+        },
+        (err) => {
+          console.warn('[play] playback error:', err?.message || err);
+          try { socket.emit('play_error', String(err?.message || 'playback error')); } catch (_) {}
+          if (process.env.KEEP_UPLOADS === '1') {
+            console.log('[play] KEEP_UPLOADS=1 set; skipping delete after error for', filePath);
+          } else {
+            fs.unlink(filePath, (e2) => {
+              if (e2) console.warn('[play] failed to delete after error:', e2?.message || e2);
+              else console.log('[play] deleted upload file after error', filePath);
+            });
+          }
+        }
+      );
+    } catch (e) {
+      console.warn('[play] exception:', e?.message || e);
+      try { socket.emit('play_error', String((e && e.message) || 'playback error')); } catch (_) {}
+    }
   });
 });
 
@@ -753,7 +958,10 @@ client.on('messageCreate', async (message) => {
       const helpText = [
         '**Commands**',
         '- -help | -commands: Show this help',
-        '- -clip: Create a 30s clip of recent voice (DM if toggled, else post to clip channel)',
+  '- -clip [title]: Create a 30s clip of recent voice with optional title (DM if toggled, else post to clip channel)',
+    '- -beep: Play a short test beep in the current voice channel (diagnostics)',
+        '- -playserver <filename>: Play a file that already exists under public/uploads',
+        '- -playlast: Play the most recently uploaded file from public/uploads',
         '- -dmtoggle: Toggle DM delivery of clips for yourself',
         '- -setclip <channel_id|#mention>: Server owner only, sets the text channel to post clips',
   '- -ignorevc <channel_id|#mention>: Server owner only, ignore a voice channel for auto-join',
@@ -766,6 +974,126 @@ client.on('messageCreate', async (message) => {
         '- Also works with common variants like: "terry clip", "okay terry, clip that", or split phrases like "all right, terry" then "you click that" within a few seconds',
       ].join('\n');
       try { await message.reply(helpText); } catch (_) {}
+      return;
+    }
+
+    if (content === '-beep') {
+      try {
+        if (!currentConnection) { await message.reply('Not in a voice channel.'); return; }
+        if (!currentPlayer) {
+          currentPlayer = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+          try { currentConnection.subscribe(currentPlayer); } catch (_) {}
+        }
+        const sampleRate = 48000; const channels = 2; const sec = 1.0; const frames = Math.floor(sampleRate * sec);
+        const buf = Buffer.alloc(frames * channels * 2);
+        const freq = 880; // 880 Hz beep
+        for (let i = 0; i < frames; i++) {
+          const t = i / sampleRate; const s = Math.sin(2 * Math.PI * freq * t);
+          const v = Math.max(-1, Math.min(1, s)) * 0.4; // -8 dBFS approx
+          const i16 = Math.round(v * 32767);
+          buf.writeInt16LE(i16, (i * channels + 0) * 2);
+          buf.writeInt16LE(i16, (i * channels + 1) * 2);
+        }
+        const pcmStream = Readable.from(buf);
+        const enc = new prism.opus.Encoder({ rate: 48000, channels: 2, frameSize: 960 });
+        const opus = pcmStream.pipe(enc);
+        const res = createAudioResource(opus, { inputType: StreamType.Opus });
+        currentPlayer.play(res);
+        await message.reply('Beep sent. If you do not hear it, check voice permissions and logs.');
+      } catch (e) {
+        try { await message.reply('Failed to beep: ' + (e?.message || e)); } catch (_) {}
+      }
+      return;
+    }
+
+    // Play a file that already exists on the server under public/uploads
+    if (content.startsWith('-playserver')) {
+      try {
+        if (!currentConnection) { await message.reply('Not in a voice channel.'); return; }
+        if (!currentPlayer) {
+          currentPlayer = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+          try { currentConnection.subscribe(currentPlayer); } catch (_) {}
+        }
+        const parts = String(message.content || '').trim().split(/\s+/);
+        if (parts.length < 2) { await message.reply('Usage: -playserver <filename-in-uploads>'); return; }
+        const name = parts[1].replace(/[^a-zA-Z0-9._-]+/g, '_');
+        const filePath = path.join(__dirname, 'public', 'uploads', name);
+        if (!fs.existsSync(filePath)) { await message.reply('File not found: ' + name); return; }
+        await message.reply('Playing server file: ' + name);
+        console.log('[playserver] spawning ffmpeg for PCM decode (raw s16le):', filePath);
+        const ff = spawn('ffmpeg', [
+          '-hide_banner', '-loglevel', 'error', '-nostdin',
+          '-re', '-i', filePath,
+          '-vn', '-sn', '-dn',
+          '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'
+        ], { stdio: ['ignore', 'pipe', 'pipe'] });
+        ff.stderr.on('data', d => {
+          const s = d.toString();
+          if (s.trim()) console.warn('[playserver][ffmpeg]', s.trim());
+        });
+        ff.on('close', (code, signal) => {
+          console.log('[playserver] ffmpeg exited code', code, 'signal', signal);
+        });
+  const pcm = ff.stdout;
+  const enc = new prism.opus.Encoder({ rate: 48000, channels: 2, frameSize: 960 });
+  enc.on('error', (e) => console.warn('[playserver] opus encoder error:', e?.message || e));
+  const opus = pcm.pipe(enc);
+  const resource = createAudioResource(opus, { inputType: StreamType.Opus });
+  currentPlayer.play(resource);
+      } catch (e) {
+        try { await message.reply('Failed to playserver: ' + (e?.message || e)); } catch (_) {}
+      }
+      return;
+    }
+
+    // Play the most recently uploaded file from public/uploads
+    if (content === '-playlast' || content === '-playlatest') {
+      try {
+        if (!currentConnection) { await message.reply('Not in a voice channel.'); return; }
+        if (!currentPlayer) {
+          currentPlayer = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+          try { currentConnection.subscribe(currentPlayer); } catch (_) {}
+        }
+        const uploadsDir = path.join(__dirname, 'public', 'uploads');
+        if (!fs.existsSync(uploadsDir)) { await message.reply('No uploads directory found.'); return; }
+        const entries = await fs.promises.readdir(uploadsDir);
+        if (!entries || entries.length === 0) { await message.reply('No files found in uploads.'); return; }
+        // Build {name, mtimeMs} list and pick newest regular file
+        const files = [];
+        for (const name of entries) {
+          const full = path.join(uploadsDir, name);
+          try {
+            const st = await fs.promises.stat(full);
+            if (st.isFile()) files.push({ name, path: full, mtimeMs: st.mtimeMs });
+          } catch (_) {}
+        }
+        if (files.length === 0) { await message.reply('No files found in uploads.'); return; }
+        files.sort((a,b) => b.mtimeMs - a.mtimeMs);
+        const chosen = files[0];
+        await message.reply('Playing latest upload: ' + chosen.name);
+        console.log('[playlast] spawning ffmpeg for PCM decode (raw s16le):', chosen.path);
+        const ff = spawn('ffmpeg', [
+          '-hide_banner', '-loglevel', 'error', '-nostdin',
+          '-re', '-i', chosen.path,
+          '-vn', '-sn', '-dn',
+          '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'
+        ], { stdio: ['ignore', 'pipe', 'pipe'] });
+        ff.stderr.on('data', d => {
+          const s = d.toString();
+          if (s.trim()) console.warn('[playlast][ffmpeg]', s.trim());
+        });
+        ff.on('close', (code, signal) => {
+          console.log('[playlast] ffmpeg exited code', code, 'signal', signal);
+        });
+        const pcm = ff.stdout;
+        const enc = new prism.opus.Encoder({ rate: 48000, channels: 2, frameSize: 960 });
+        enc.on('error', (e) => console.warn('[playlast] opus encoder error:', e?.message || e));
+        const opus = pcm.pipe(enc);
+        const resource = createAudioResource(opus, { inputType: StreamType.Opus });
+        currentPlayer.play(resource);
+      } catch (e) {
+        try { await message.reply('Failed to playlast: ' + (e?.message || e)); } catch (_) {}
+      }
       return;
     }
 
@@ -853,7 +1181,10 @@ client.on('messageCreate', async (message) => {
       return;
     }
     if (content === '-clip' || content.startsWith('-clip ')) {
-      handleVoiceClipCommand(message.author.username, message.author.id);
+      const raw = String(message.content || '').trim();
+      const idx = raw.indexOf(' ');
+      const title = idx > 0 ? raw.slice(idx + 1).trim() : '';
+      handleVoiceClipCommand(message.author.username, message.author.id, title);
       try { await message.react('🎬'); } catch (_) {}
     }
     // Toggle DM delivery of clips for this user (default off)

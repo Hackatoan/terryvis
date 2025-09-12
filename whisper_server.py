@@ -1,4 +1,3 @@
-import io
 import tempfile
 import os
 from flask import Flask, request, jsonify
@@ -9,20 +8,15 @@ import soundfile as sf
 import threading
 import queue
 
-# Optionally load environment from a .env file if python-dotenv is installed
+# Load env from .env if python-dotenv is available (optional)
 try:
     from dotenv import load_dotenv  # type: ignore
     load_dotenv()
 except Exception:
     pass
-try:
-    import webrtcvad  # not used now, but kept for optional future use
-    HAS_WEBRTCVAD = True
-except Exception:
-    HAS_WEBRTCVAD = False
 
 app = Flask(__name__)
-# Select model from env; defaults to tiny.en. Consider base.en or small.en for better quality.
+# Model from env (default tiny.en)
 WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "tiny.en")
 print(f"[WHISPER] Loading model: {WHISPER_MODEL}")
 model = whisper.load_model(WHISPER_MODEL)
@@ -40,11 +34,11 @@ def transcribe_worker():
         req, arr, tmp_name, respond = job
         print(f"[WHISPER QUEUE] Processing job. Queue size: {transcribe_queue.qsize()}")
         try:
-            # Timeout logic: run transcribe in a thread with timeout
+            # Run transcribe with a timeout via thread
             result_holder = {}
             def do_transcribe():
                 try:
-                    # Keep options minimal to avoid over-filtering
+                    # Minimal options to avoid over-filtering
                     result_holder['result'] = model.transcribe(
                         tmp_name,
                         language='en',
@@ -99,7 +93,7 @@ def transcribe():
         # too short to be useful; treat as no-content
         return jsonify({"error": "Audio data too short (<0.2s)"}), 204
 
-    # Basic noise gate: low threshold on mean absolute amplitude (Int16 scale)
+    # Basic noise gate on mean absolute amplitude (Int16 scale)
     mean_energy = float(np.mean(np.abs(arr)))
     NOISE_GATE = 6.0  # very permissive
     if mean_energy < NOISE_GATE:

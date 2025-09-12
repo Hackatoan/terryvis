@@ -4,7 +4,7 @@ WORKDIR /app
 
 # System deps for native modules like @discordjs/opus (node-gyp)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 make g++ \
+    python3 make g++ ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 # Install dependencies
