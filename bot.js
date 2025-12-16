@@ -2,6 +2,33 @@
 
 // --- Imports and Setup ---
 require('dotenv').config();
+/*
+  terryvis bot - main server
+
+  Overview:
+  - This file hosts the Discord bot (voice join/monitoring, clip creation),
+    a small Express + Socket.IO web panel for monitoring and playing audio,
+    and a simple per-user clip registry persisted to `data/user-clips.json`.
+
+  - Audio flow:
+    * Per-user rolling PCM ring buffers collect recent audio in `userRings`.
+    * `handleVoiceClipCommand()` mixes the last 30s and writes a WAV file,
+      then posts that WAV as a Discord attachment (DM or configured clip channel).
+    * When a clip is posted to Discord the bot records the Discord attachment URL
+      into a per-user registry via `addUserClip()` so clips are referenced by
+      the canonical Discord-hosted link (no server-hosted fallback).
+
+  - Web UI (Socket.IO): serves `public/` and provides real-time events:
+    * `update` - current channel + members
+    * `transcript`, `transcripts_recent` - live and recent transcripts
+    * `clips_recent`, `clip_posted` - recent broadcast clips
+    * `user_clips`, `user_clips_updated` - per-user clip registry
+
+  - Config: environment variables are consolidated near the top so they are
+    easy to find and change.
+
+  See inline comments for more detail on individual helpers.
+*/
 const { Client, GatewayIntentBits } = require('discord.js');
 const { joinVoiceChannel, EndBehaviorType, createAudioPlayer, createAudioResource, NoSubscriberBehavior, StreamType, AudioPlayerStatus, VoiceConnectionStatus, entersState } = require('@discordjs/voice');
 const fs = require('fs');
@@ -20,8 +47,13 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-// Optional env config
+// Consolidated environment/config constants
+const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN || '';
 const WHISPER_URL = process.env.WHISPER_URL || 'http://localhost:5005/transcribe';
+const CLIPS_BASE_URL = process.env.CLIPS_BASE_URL || `http://localhost:${PORT}`;
+const CLIPS_CHANNEL_ID = process.env.CLIPS_CHANNEL_ID || null;
+const KEEP_UPLOADS = process.env.KEEP_UPLOADS === '1';
 
 // Helper: coerce various binary forms into a Node Buffer
 function toNodeBuffer(data) {
@@ -94,6 +126,68 @@ async function playFileFromDisk(filePath, onStart, onEnd, onError) {
   }
 }
 
+// Helper: generate lightweight TTS using local `espeak` (very small footprint)
+// Pipes espeak WAV -> ffmpeg (resample/convert) -> opus encoder -> play
+async function playTextTTS(text, onStart, onEnd, onError) {
+  try {
+    if (!currentConnection) throw new Error('No voice connection');
+    await entersState(currentConnection, VoiceConnectionStatus.Ready, 10000);
+    if (!currentPlayer) {
+      currentPlayer = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+      try { currentConnection.subscribe(currentPlayer); } catch (_) {}
+    }
+    // Limit text length to avoid command-line or performance issues
+    const safeText = String(text || '').trim().slice(0, 400);
+    if (!safeText) throw new Error('No text provided for TTS');
+
+    // Spawn espeak to produce WAV on stdout
+    const es = spawn('espeak', ['--stdout', '-v', 'en-us', safeText], { stdio: ['ignore', 'pipe', 'pipe'] });
+    es.stderr.on('data', d => { const s = d.toString(); if (s.trim()) console.warn('[tts][espeak]', s.trim()); });
+    es.on('error', (err) => {
+      console.warn('[tts] espeak spawn error:', err?.message || err);
+      onError && onError(err);
+    });
+    es.on('close', (code) => {
+      if (typeof code === 'number' && code !== 0) console.log('[tts] espeak exited code', code);
+    });
+
+    // Pipe espeak WAV into ffmpeg to produce raw s16le 48kHz stereo PCM
+    const ff = spawn('ffmpeg', [
+      '-hide_banner', '-loglevel', 'error', '-nostdin',
+      '-f', 'wav', '-i', 'pipe:0',
+      '-vn', '-sn', '-dn',
+      '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'
+    ], { stdio: ['pipe', 'pipe', 'pipe'] });
+    ff.stderr.on('data', d => { const s = d.toString(); if (s.trim()) console.warn('[tts][ffmpeg]', s.trim()); });
+    ff.on('error', (err) => {
+      console.warn('[tts] ffmpeg spawn error:', err?.message || err);
+      onError && onError(err);
+    });
+    ff.on('close', (code) => { if (typeof code === 'number' && code !== 0) console.log('[tts] ffmpeg exited code', code); });
+
+    // Wire streams: espeak stdout -> ffmpeg stdin
+    es.stdout.pipe(ff.stdin);
+
+    const pcm = ff.stdout;
+    const enc = new prism.opus.Encoder({ rate: 48000, channels: 2, frameSize: 960 });
+    enc.on('error', (e) => { console.warn('[tts] opus encoder error:', e?.message || e); onError && onError(e); });
+    const opus = pcm.pipe(enc);
+    const resource = createAudioResource(opus, { inputType: StreamType.Opus });
+    try { currentPlayer.stop(true); } catch (_) {}
+
+    const started = () => { onStart && onStart(); try { currentPlayer.off(AudioPlayerStatus.Playing, started); } catch (_) {} };
+    const ended = () => { onEnd && onEnd(); try { currentPlayer.off(AudioPlayerStatus.Idle, ended); } catch (_) {} };
+    try { currentPlayer.removeAllListeners(AudioPlayerStatus.Playing); } catch (_) {}
+    try { currentPlayer.removeAllListeners(AudioPlayerStatus.Idle); } catch (_) {}
+    currentPlayer.on(AudioPlayerStatus.Playing, started);
+    currentPlayer.on(AudioPlayerStatus.Idle, ended);
+    currentPlayer.on('error', (err) => { console.warn('[tts] player error:', err?.message || err); onError && onError(err); });
+    currentPlayer.play(resource);
+  } catch (e) {
+    onError && onError(e);
+  }
+}
+
 // Discord client setup
 const enabledIntents = [
   GatewayIntentBits.Guilds,
@@ -116,6 +210,56 @@ let monitorInterval;
 // Buffers for web backfill/sync
 const recentTranscripts = []; // { userId, username, text, timestamp }
 const recentClips = []; // { url, username, timestamp }
+// Persistent web panel state (loaded/saved to disk)
+const DATA_DIR = path.join(__dirname, 'data');
+const PANEL_STATE_PATH = path.join(DATA_DIR, 'panel-state.json');
+let _panelSaveTimer = null;
+
+function ensureDataDir() {
+  try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch (_) {}
+}
+
+// Save clip file into per-user folder and produce a public MP3 URL (served under /clips)
+// NOTE: `saveClipForUser` (previously used to create server-hosted mp3s)
+// was removed in favor of using Discord-hosted attachment URLs only.
+
+function loadPanelState() {
+  try {
+    if (!fs.existsSync(PANEL_STATE_PATH)) return;
+    const raw = fs.readFileSync(PANEL_STATE_PATH, 'utf8');
+    const obj = JSON.parse(raw || '{}');
+    if (Array.isArray(obj.transcripts)) {
+      recentTranscripts.length = 0;
+      for (const t of obj.transcripts.slice(-100)) recentTranscripts.push(t);
+    }
+    if (Array.isArray(obj.clips)) {
+      recentClips.length = 0;
+      for (const c of obj.clips.slice(-20)) recentClips.push(c);
+    }
+    console.log('[panel] Loaded state:', recentTranscripts.length, 'transcripts,', recentClips.length, 'clips');
+  } catch (e) {
+    console.warn('[panel] Failed to load panel state:', e?.message || e);
+  }
+}
+
+function savePanelStateImmediate() {
+  try {
+    ensureDataDir();
+    const obj = { transcripts: recentTranscripts.slice(-100), clips: recentClips.slice(-20) };
+    fs.writeFileSync(PANEL_STATE_PATH, JSON.stringify(obj, null, 2));
+    // console.log('[panel] state saved');
+  } catch (e) {
+    console.warn('[panel] Failed to save panel state:', e?.message || e);
+  }
+}
+
+function scheduleSavePanelState() {
+  if (_panelSaveTimer) return;
+  _panelSaveTimer = setTimeout(() => {
+    _panelSaveTimer = null;
+    savePanelStateImmediate();
+  }, 1000);
+}
 
 // --- Persistent config for clip channel and DM preferences ---
 const CONFIG_PATH = path.join(__dirname, 'clips-config.json');
@@ -135,6 +279,70 @@ function saveConfig() {
   } catch (_) {}
 }
 let config = loadConfig();
+// Load persisted panel state (transcripts/clips)
+ensureDataDir();
+loadPanelState();
+
+// Per-user clip registry (stores Discord-hosted URLs for user clips)
+const USER_CLIPS_PATH = path.join(DATA_DIR, 'user-clips.json');
+let userClips = {};
+function loadUserClips() {
+  try {
+    if (!fs.existsSync(USER_CLIPS_PATH)) return;
+    const raw = fs.readFileSync(USER_CLIPS_PATH, 'utf8');
+    const obj = JSON.parse(raw || '{}');
+    userClips = obj || {};
+    console.log('[userClips] Loaded', Object.keys(userClips).length, 'users');
+  } catch (e) {
+    console.warn('[userClips] Failed to load:', e?.message || e);
+    userClips = {};
+  }
+}
+function saveUserClipsImmediate() {
+  try {
+    ensureDataDir();
+    fs.writeFileSync(USER_CLIPS_PATH, JSON.stringify(userClips, null, 2));
+  } catch (e) {
+    console.warn('[userClips] Failed to save:', e?.message || e);
+  }
+}
+function addUserClip(userId, url, title) {
+  try {
+    if (!userId || !url) return;
+    userClips[userId] = userClips[userId] || [];
+    userClips[userId].push({ url, title: sanitizeClipTitle(title || ''), timestamp: Date.now() });
+    // Keep a reasonable cap per-user
+    if (userClips[userId].length > 200) userClips[userId].splice(0, userClips[userId].length - 200);
+    saveUserClipsImmediate();
+    try { if (typeof io !== 'undefined' && io && io.emit) io.emit('user_clips_updated', { userId, clips: userClips[userId] }); } catch (_) {}
+  } catch (e) { console.warn('[userClips] add error:', e?.message || e); }
+}
+
+// Remove a specific clip entry for a user. The client will generally send the
+// clip `url` or `timestamp` to identify which entry to remove. We match by url
+// first; if not provided, timestamp will be used.
+function removeUserClip(userId, { url, timestamp } = {}) {
+  try {
+    if (!userId || (!url && !timestamp)) return false;
+    const arr = userClips[userId];
+    if (!Array.isArray(arr) || arr.length === 0) return false;
+    let idx = -1;
+    if (url) idx = arr.findIndex(x => x.url === url);
+    if (idx === -1 && timestamp) idx = arr.findIndex(x => Math.abs((x.timestamp||0) - Number(timestamp)) < 2000);
+    if (idx === -1) return false;
+    arr.splice(idx, 1);
+    userClips[userId] = arr;
+    saveUserClipsImmediate();
+    try { if (typeof io !== 'undefined' && io && io.emit) io.emit('user_clips_updated', { userId, clips: userClips[userId] }); } catch (_) {}
+    return true;
+  } catch (e) { console.warn('[userClips] remove error:', e?.message || e); return false; }
+}
+loadUserClips();
+
+// Save panel state on shutdown signals to avoid losing recent events
+process.on('exit', () => { savePanelStateImmediate(); });
+process.on('SIGINT', () => { savePanelStateImmediate(); process.exit(0); });
+process.on('SIGTERM', () => { savePanelStateImmediate(); process.exit(0); });
 
 
 // --- Real-time update of web UI when anyone joins/leaves the current channel ---
@@ -346,7 +554,7 @@ function sanitizeClipTitle(raw) {
   return s;
 }
 
-async function handleVoiceClipCommand(requestedByName, requestedById, titleOptional) {
+async function handleVoiceClipCommand(requestedByName, requestedById, titleOptional, targetUserId) {
   try {
     const guild = client.guilds.cache.first();
     if (!guild || !currentChannelId) return;
@@ -387,6 +595,7 @@ async function handleVoiceClipCommand(requestedByName, requestedById, titleOptio
     });
 
     let delivered = false;
+    let deliveredUrl = null;
     // If the user has DM toggle enabled, try to send the clip to their DMs
     const dmOn = !!config.dmPrefs[requestedById];
     if (dmOn) {
@@ -410,7 +619,7 @@ async function handleVoiceClipCommand(requestedByName, requestedById, titleOptio
   // If not delivered via DM, post to configured guild clip channel (fallback to env if unset)
     if (!delivered) {
       const guildCfg = config.guilds[guild.id] || {};
-      const clipChannelId = guildCfg.clipChannelId || process.env.CLIPS_CHANNEL_ID;
+      const clipChannelId = guildCfg.clipChannelId || CLIPS_CHANNEL_ID;
       const clipsText = clipChannelId ? guild.channels.cache.get(clipChannelId) : null;
       if (clipsText && typeof clipsText.isTextBased === 'function' && clipsText.isTextBased()) {
         try {
@@ -430,7 +639,22 @@ async function handleVoiceClipCommand(requestedByName, requestedById, titleOptio
       }
     }
 
-    // Delete the local file after successful delivery
+    // If targetUserId specified, register a per-user saved clip. Prefer a Discord-hosted URL
+    if (targetUserId) {
+      try {
+        // Only register per-user clips if we have a Discord-hosted URL (from DM or clip channel post).
+        if (deliveredUrl) {
+          addUserClip(targetUserId, deliveredUrl, titleOptional || 'clip');
+          const clipInfoUser = { url: deliveredUrl, username: (client.users.cache.get(targetUserId)?.username) || targetUserId, timestamp: Date.now(), title: sanitizeClipTitle(titleOptional) };
+          recentClips.push(clipInfoUser);
+          if (recentClips.length > 20) recentClips.splice(0, recentClips.length - 20);
+          scheduleSavePanelState();
+          io.emit('clip_posted', clipInfoUser);
+        }
+      } catch (e) { console.warn('[handleVoiceClipCommand] error:', e?.message || e); }
+    }
+
+    // Delete the local file after successful delivery (we kept user copy already)
     if (delivered) {
       try { await fs.promises.unlink(filePath); } catch (_) {}
     }
@@ -439,7 +663,9 @@ async function handleVoiceClipCommand(requestedByName, requestedById, titleOptio
     if (deliveredUrl) {
       const clipInfo = { url: deliveredUrl, username: requestedByName, timestamp: Date.now(), title: sanitizeClipTitle(titleOptional) };
       recentClips.push(clipInfo);
-      if (recentClips.length > 100) recentClips.shift();
+      // Keep only last 20 clips for persistence/UI
+      if (recentClips.length > 20) recentClips.splice(0, recentClips.length - 20);
+      scheduleSavePanelState();
       io.emit('clip_posted', clipInfo);
     }
   } catch (_) {
@@ -481,6 +707,9 @@ function appendTranscriptContext(userId, text) {
   while (recentTranscripts.length > 200 || (recentTranscripts[0] && recentTranscripts[0].timestamp < staleCutoff)) {
     recentTranscripts.shift();
   }
+  // Persist updated transcripts (trim to 100 for disk)
+  if (recentTranscripts.length > 100) recentTranscripts.splice(0, recentTranscripts.length - 100);
+  scheduleSavePanelState();
 }
 
 function getContextText(userId) {
@@ -491,107 +720,26 @@ function getContextText(userId) {
 function shouldTriggerClipFromContext(userId) {
   const now = Date.now();
   const last = lastClipTriggerByUser.get(userId) || 0;
-  // Cooldown to avoid duplicate triggers
-  if (now - last < 4000) return false;
+  // Cooldown to avoid duplicate triggers (longer to avoid accidental retrigger)
+  if (now - last < 15000) return false;
   const ctx = getContextText(userId);
   if (!ctx) return false;
-  // Common ASR confusions: clip/click
-  const clipWord = '(?:clip|click)';
-  // Pattern A: "terry" within ~5 words of clip
-  const patA = new RegExp(`\\bterry\\b[\\s,]*(?:\\w+\\s+){0,5}?${clipWord}\\b(?:\\s+(?:it|that|this))?`);
-  // Pattern B: clip that ... terry
-  const patB = new RegExp(`${clipWord}\\b(?:\\s+(?:it|that|this))?(?:\\s+\\w+){0,5}\\s+terry\\b`);
-  // Pattern C: polite/openers then terry then clip
-  const openers = '(?:ok(?:ay)?|al+right|all right|hey|yo)';
-  const patC = new RegExp(`\\b${openers}\\b[\\s,]*terry[\\s,]*(?:\\w+\\s+){0,4}?${clipWord}\\b(?:\\s+(?:it|that|this))?`);
-  // Pattern D: short forms like "terry clip" or "terry, clip"
-  const patD = new RegExp(`\\bterry[\\s,]*${clipWord}\\b`);
-
-  const matched = patA.test(ctx) || patB.test(ctx) || patC.test(ctx) || patD.test(ctx);
-  if (matched) {
-    lastClipTriggerByUser.set(userId, now);
-    // Clear context to reduce immediate retrigger from same words
-    transcriptHistoryByUser.set(userId, []);
-    return true;
-  }
-
-  // --- Fuzzy fallback: allow near-misses like "club that" near "terry" ---
-  // Levenshtein distance for small words
-  function lev(a, b) {
-    a = a.toLowerCase(); b = b.toLowerCase();
-    const m = a.length, n = b.length;
-    const dp = Array.from({ length: m + 1 }, () => new Array(n + 1));
-    for (let i = 0; i <= m; i++) dp[i][0] = i;
-    for (let j = 0; j <= n; j++) dp[0][j] = j;
-    for (let i = 1; i <= m; i++) {
-      for (let j = 1; j <= n; j++) {
-        const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-        dp[i][j] = Math.min(
-          dp[i - 1][j] + 1,
-          dp[i][j - 1] + 1,
-          dp[i - 1][j - 1] + cost
-        );
-      }
-    }
-    return dp[m][n];
-  }
-
-  function normalizeTok(tok) {
-    return (tok || '').toLowerCase().replace(/[^a-z]/g, '');
-  }
-
-  const nearClipWhitelist = new Set(['clip', 'click', 'clips', 'clipped', 'cliff', 'club']);
-  function looksLikeClipCore(t) {
-    if (!t) return false;
-    if (nearClipWhitelist.has(t)) return true;
-    // Distance threshold of 1 for very short word
-    return lev(t, 'clip') <= 1;
-  }
-  function looksLikeClip(tok) {
-    const t = normalizeTok(tok);
-    if (!t) return false;
-    if (looksLikeClipCore(t)) return true;
-    // Handle re- prefixed single token like "reclip"
-    if (t.startsWith('re') && looksLikeClipCore(t.slice(2))) return true;
-    return false;
-  }
-
-  const words = ctx.split(/\s+/).map(w => w.trim()).filter(Boolean);
-  const lower = words.map(w => normalizeTok(w));
-  const terryIdx = lower.map((w, i) => ({ w, i })).filter(x => x.w === 'terry').map(x => x.i);
-
-  // Case 1: after "terry", within 5 tokens, a near-clip word (supports "re clip" and "reclip")
-  for (const ti of terryIdx) {
-    for (let j = ti + 1; j <= Math.min(lower.length - 1, ti + 5); j++) {
-      const tok = lower[j];
-      const nextTok = lower[j + 1] || '';
-      if (looksLikeClip(tok) || (tok === 're' && looksLikeClipCore(nextTok))) {
-        lastClipTriggerByUser.set(userId, now);
-        transcriptHistoryByUser.set(userId, []);
-        return true;
-      }
-    }
-  }
-
-  // Case 2: pattern like "(clip~) (that|it|this) ... terry" within a short window
-  const pronouns = new Set(['that', 'it', 'this']);
-  for (let i = 0; i < lower.length; i++) {
-    const tok = lower[i];
-    const isClipish = looksLikeClip(tok) || (tok === 're' && looksLikeClipCore(lower[i + 1] || ''));
-    if (isClipish) {
-      const pronTok = tok === 're' ? (lower[i + 2] || '') : (lower[i + 1] || '');
-      const hasPron = pronouns.has(pronTok);
-      // search for terry within next 5 tokens (offset depends on whether two-token form is used)
-      const start = tok === 're' ? i + 3 : i + 2;
-      if (hasPron) {
-        for (let k = start; k <= Math.min(lower.length - 1, start + 5); k++) {
-          if (lower[k] === 'terry') {
-            lastClipTriggerByUser.set(userId, now);
-            transcriptHistoryByUser.set(userId, []);
-            return true;
-          }
-        }
-      }
+  // Even stricter: only accept exact canonical phrases in the recent context.
+  // This removes adjacency heuristics to minimize false positives.
+  const canonical = [
+    'terry clip that',
+    'okay terry clip that',
+    'ok terry clip that',
+    'terry clip',
+    'terry, clip',
+    'reclip that',
+    're-clip that'
+  ];
+  for (const p of canonical) {
+    if (ctx.includes(p)) {
+      lastClipTriggerByUser.set(userId, now);
+      transcriptHistoryByUser.set(userId, []);
+      return true;
     }
   }
   return false;
@@ -629,10 +777,7 @@ function getMostPopulatedVoiceChannel(guild) {
 }
 
 
-// --- PCM mixing and rolling buffer for clips (currently not used, but left for future use) ---
-// function mixAndBufferPcm(userBuffers, bufferSize) {
-//   ...existing code...
-// }
+// (Removed an old unused PCM mixing stub to reduce clutter)
 
 // --- Join a voice channel and monitor audio, transcribe, and handle clips ---
 function leaveVoiceChannel(reason = '') {
@@ -738,9 +883,11 @@ function joinAndMonitor(channel) {
             st.whisperBuf = st.whisperBuf.slice(MIN_CHUNK_SAMPLES_STEREO);
             const audioBuffer = Buffer.from(chunk16k.buffer);
             const userName = st.name;
+            // For short chunks used to detect voice-trigger commands, send a narrow grammar
+            const triggerGrammar = JSON.stringify(["terry clip that","terry clip","clip that","re-clip that","okay terry clip that"]);
             st.transcribeQueue = st.transcribeQueue.then(() =>
               axios.post(WHISPER_URL, audioBuffer, {
-                headers: { 'Content-Type': 'application/octet-stream' },
+                headers: { 'Content-Type': 'application/octet-stream', 'X-ASR-GRAMMAR': triggerGrammar },
                 timeout: 20000
               }).then(res => {
                 if (res.data && res.data.text) {
@@ -837,12 +984,36 @@ io.on('connection', (socket) => {
     channel: channelObj,
     members: currentMembers
   });
+  // send per-user clip registry for webpanel
+  try { socket.emit('user_clips', userClips || {}); } catch (_) {}
   // Backfill recent events
   try {
     socket.emit('transcripts_recent', recentTranscripts.slice(-100));
     const sortedClips = recentClips.slice().sort((a,b) => b.timestamp - a.timestamp);
     socket.emit('clips_recent', sortedClips);
   } catch (_) {}
+
+  // Web: request playback of a URL (download then play)
+  socket.on('play_url', async ({ url }) => {
+    try {
+      if (!url) return;
+      // download to uploads
+      const upDir = path.join(__dirname, 'public', 'uploads');
+      if (!fs.existsSync(upDir)) fs.mkdirSync(upDir, { recursive: true });
+      const unique = `${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+      const ext = (url.split('.').pop().split(/\?|#/)[0] || 'mp3').replace(/[^a-z0-9]/gi,'');
+      const fileName = `download_${unique}.${ext}`;
+      const dest = path.join(upDir, fileName);
+      const writer = fs.createWriteStream(dest);
+      const resp = await axios({ url, method: 'GET', responseType: 'stream', timeout: 20000 });
+      resp.data.pipe(writer);
+      await new Promise((res, rej) => { writer.on('finish', res); writer.on('error', rej); });
+      // play the downloaded file
+      playFileFromDisk(dest, () => {}, () => { try { fs.unlinkSync(dest); } catch (_) {} }, (e) => { try { fs.unlinkSync(dest); } catch (_) {} });
+    } catch (e) {
+      console.warn('[play_url] error:', e?.message || e);
+    }
+  });
 
   // Clip button: throttle requests per socket to avoid spam
   let lastClipReq = 0;
@@ -856,6 +1027,28 @@ io.on('connection', (socket) => {
       const title = payload && typeof payload.title === 'string' ? payload.title : '';
       await handleVoiceClipCommand(botName, botId, title);
     } catch (_) {}
+  });
+
+  // Allow assigning a clip (by URL) to a user from the web UI
+  socket.on('assign_clip_to_user', async ({ url, userId, title }) => {
+    try {
+      if (!url || !userId) return;
+      addUserClip(userId, url, title || 'clip');
+      // notify requester of success
+      try { socket.emit('assign_result', { ok: true, userId, url }); } catch (_) {}
+    } catch (e) {
+      try { socket.emit('assign_result', { ok: false, error: String(e?.message || e) }); } catch (_) {}
+    }
+  });
+  // Allow removing an assigned clip from a user (UI action)
+  socket.on('remove_user_clip', async ({ userId, url, timestamp }) => {
+    try {
+      if (!userId) { socket.emit('remove_result', { ok: false, error: 'missing userId' }); return; }
+      const ok = removeUserClip(userId, { url, timestamp });
+      if (ok) socket.emit('remove_result', { ok: true, userId, url, timestamp }); else socket.emit('remove_result', { ok: false, error: 'not found' });
+    } catch (e) {
+      try { socket.emit('remove_result', { ok: false, error: String(e?.message || e) }); } catch (_) {}
+    }
   });
 
   // Web-initiated playback: upload binary and stream into Discord via ffmpeg (prism-media)
@@ -918,7 +1111,7 @@ io.on('connection', (socket) => {
         () => { try { socket.emit('play_started'); } catch (_) {} },
         () => {
           try { socket.emit('play_ended'); } catch (_) {}
-          if (process.env.KEEP_UPLOADS === '1') {
+          if (KEEP_UPLOADS) {
             console.log('[play] KEEP_UPLOADS=1 set; skipping delete after end for', filePath);
           } else {
             fs.unlink(filePath, (err) => {
@@ -930,7 +1123,7 @@ io.on('connection', (socket) => {
         (err) => {
           console.warn('[play] playback error:', err?.message || err);
           try { socket.emit('play_error', String(err?.message || 'playback error')); } catch (_) {}
-          if (process.env.KEEP_UPLOADS === '1') {
+          if (KEEP_UPLOADS) {
             console.log('[play] KEEP_UPLOADS=1 set; skipping delete after error for', filePath);
           } else {
             fs.unlink(filePath, (e2) => {
@@ -952,26 +1145,28 @@ client.on('messageCreate', async (message) => {
   try {
     if (!message || message.author?.bot) return;
     if (!message.guild) return;
-    const content = String(message.content || '').trim().toLowerCase();
+    const rawContent = String(message.content || '').trim();
+    const content = rawContent.toLowerCase();
     // Help: list all commands and voice trigger
     if (content === '-help' || content === '-commands') {
       const helpText = [
         '**Commands**',
         '- -help | -commands: Show this help',
-  '- -clip [title]: Create a 30s clip of recent voice with optional title (DM if toggled, else post to clip channel)',
-    '- -beep: Play a short test beep in the current voice channel (diagnostics)',
+        '- -clip [title] or -clip @user [title]: Create a 30s clip of recent voice. Clips are delivered as Discord attachments (DM or configured clip channel).',
+        '- -clipfolder @user: List saved Discord-hosted clip links for the specified user (most recent first).',
+        '- -addlast @user: Add the most recent clip to the mentioned user (registers Discord-hosted URL)',
+        '- -beep: Play a short test beep in the current voice channel (diagnostics)',
         '- -playserver <filename>: Play a file that already exists under public/uploads',
         '- -playlast: Play the most recently uploaded file from public/uploads',
         '- -dmtoggle: Toggle DM delivery of clips for yourself',
         '- -setclip <channel_id|#mention>: Server owner only, sets the text channel to post clips',
-  '- -ignorevc <channel_id|#mention>: Server owner only, ignore a voice channel for auto-join',
-  '- -unignorevc <channel_id|#mention>: Server owner only, remove a voice channel from ignore list',
-  '- -listignorevc: List ignored voice channels',
-  '- -clipbots: Server owner only, toggle including bot users in recorded clips',
+        '- -ignorevc <channel_id|#mention>: Server owner only, ignore a voice channel for auto-join',
+        '- -unignorevc <channel_id|#mention>: Server owner only, remove a voice channel from ignore list',
+        '- -listignorevc: List ignored voice channels',
+        '- -clipbots: Server owner only, toggle including bot users in recorded clips',
         '',
-        '**Voice trigger**',
-        '- Say "terry clip that" to create a 30s clip',
-        '- Also works with common variants like: "terry clip", "okay terry, clip that", or split phrases like "all right, terry" then "you click that" within a few seconds',
+        '**Voice trigger (strict)**',
+        '- Say "terry clip that" (or short variants) to create a 30s clip. Trigger detection is intentionally strict to avoid false positives.',
       ].join('\n');
       try { await message.reply(helpText); } catch (_) {}
       return;
@@ -1002,6 +1197,40 @@ client.on('messageCreate', async (message) => {
         await message.reply('Beep sent. If you do not hear it, check voice permissions and logs.');
       } catch (e) {
         try { await message.reply('Failed to beep: ' + (e?.message || e)); } catch (_) {}
+      }
+      return;
+    }
+    // Add last delivered clip to a user: -addlast @user
+    if (content.startsWith('-addlast')) {
+      try {
+        const parts = rawContent.split(/\s+/);
+        if (parts.length < 2) { await message.reply('Usage: -addlast @user'); return; }
+        const mention = parts[1];
+        const uid = mention.replace(/[<@!>]/g, '');
+        if (!uid) { await message.reply('Invalid user mention'); return; }
+        const last = recentClips.slice().sort((a,b) => (b.timestamp||0)-(a.timestamp||0))[0];
+        if (!last || !last.url) { await message.reply('No recent clip available to add.'); return; }
+        addUserClip(uid, last.url, last.title || 'clip');
+        await message.reply(`Added last clip to <@${uid}>`);
+      } catch (e) { try { await message.reply('Failed to add last clip: ' + (e?.message || e)); } catch (_) {} }
+    }
+
+    // Lightweight local TTS: -say <text>
+    if (content.startsWith('-say') || content.startsWith('-tts')) {
+      try {
+        if (!currentConnection) { await message.reply('Not in a voice channel.'); return; }
+        // Extract text from the original (preserve casing where possible)
+        const parts = rawContent.split(/\s+/);
+        if (parts.length < 2) { await message.reply('Usage: -say <text>'); return; }
+        const text = rawContent.replace(/^(-say|-tts)\s*/i, '').trim();
+        await message.reply('Speaking: ' + (text.length > 120 ? text.slice(0, 120) + '...' : text));
+        playTextTTS(text,
+          () => {},
+          () => { /* ended */ },
+          async (err) => { console.warn('[say] error:', err?.message || err); try { await message.reply('TTS failed: ' + (err?.message || 'unknown')); } catch (_) {} }
+        );
+      } catch (e) {
+        try { await message.reply('Failed to speak: ' + (e?.message || e)); } catch (_) {}
       }
       return;
     }
@@ -1182,10 +1411,39 @@ client.on('messageCreate', async (message) => {
     }
     if (content === '-clip' || content.startsWith('-clip ')) {
       const raw = String(message.content || '').trim();
-      const idx = raw.indexOf(' ');
-      const title = idx > 0 ? raw.slice(idx + 1).trim() : '';
-      handleVoiceClipCommand(message.author.username, message.author.id, title);
+      const parts = raw.split(/\s+/);
+      // If invoked as '-clip @user [title]' save clip into mentioned user's folder
+      let title = '';
+      let targetUserId = null;
+      if (parts.length >= 2 && parts[1].startsWith('<@')) {
+        // mention format <@!id> or <@id>
+        const m = parts[1].replace(/[<@!>]/g, '');
+        targetUserId = m;
+        title = parts.slice(2).join(' ').trim();
+      } else {
+        const idx = raw.indexOf(' ');
+        title = idx > 0 ? raw.slice(idx + 1).trim() : '';
+      }
+      handleVoiceClipCommand(message.author.username, message.author.id, title, targetUserId);
       try { await message.react('🎬'); } catch (_) {}
+    }
+
+    // List clips for a user: -clipfolder @user
+    if (content.startsWith('-clipfolder')) {
+      try {
+        const raw = String(message.content || '').trim();
+        const parts = raw.split(/\s+/);
+        if (parts.length < 2) { await message.reply('Usage: -clipfolder @user'); return; }
+        const mention = parts[1];
+        const uid = mention.replace(/[<@!>]/g, '');
+        const entries = (userClips[uid] || []);
+        if (!entries || entries.length === 0) { await message.reply('No clips for that user.'); return; }
+        // List up to 50 most recent Discord-hosted URLs
+        const urls = entries.slice(-50).reverse().map(e => `${e.url} ${e.title ? '- ' + e.title : ''}`);
+        const body = urls.join('\n');
+        try { await message.reply(`Clips for <@${uid}>:\n${body}`); } catch (_) { await message.reply('Failed to send clip list (probably too long).'); }
+      } catch (e) { try { await message.reply('Error listing clips: ' + (e?.message || e)); } catch (_) {} }
+      return;
     }
     // Toggle DM delivery of clips for this user (default off)
     if (content === '-dmtoggle') {
@@ -1270,9 +1528,8 @@ setInterval(() => {
 
 
 // --- Start web server and Discord client ---
-const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 server.listen(PORT, () => {
   console.log(`Web server running on http://localhost:${PORT}`);
 });
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(DISCORD_TOKEN);

@@ -21,11 +21,37 @@ socket.on('transcripts_recent', (items) => {
   renderTranscript();
 });
 
+/*
+  Client-side audio/webpanel script
+
+  Responsibilities:
+  - Render live transcripts and recent transcript history (`transcripts_recent`, `transcript`).
+  - Render recent clips and per-user assigned clips (`clips_recent`, `user_clips`).
+  - Provide UI for: clip creation (server-side), uploading/playing audio, assigning and removing per-user clip links.
+
+  Socket events used:
+  - emit: `clip_request`, `play_upload`, `assign_clip_to_user`, `remove_user_clip`
+  - on: `update`, `transcripts_recent`, `transcript`, `clips_recent`, `clip_posted`, `user_clips`, `user_clips_updated`, `assign_result`, `remove_result`
+
+  The script keeps a small in-memory registry `userClips` to show assigned clips for the currently-selected user.
+*/
 // Clips list with Discord URLs, sorted newest first
 const clipsDiv = document.getElementById('clips');
 let clipItems = [];
+let userClips = {}; // userId -> [{url,title,timestamp}]
 function renderClips() {
-  const sorted = clipItems.slice().sort((a,b) => (b.timestamp||0)-(a.timestamp||0));
+  // If a member is selected (playMode !== 'all'), show only their assigned clips if available
+  let list = clipItems.slice();
+  if (playMode && playMode !== 'all') {
+    const uc = userClips[playMode];
+    if (Array.isArray(uc) && uc.length) {
+      list = uc.slice();
+    } else {
+      // Fall back to showing clips mentioning this user in username field
+      list = clipItems.filter(x => x.username && x.username_id === playMode || x.username === playMode);
+    }
+  }
+  const sorted = list.slice().sort((a,b) => (b.timestamp||0)-(a.timestamp||0));
   clipsDiv.innerHTML = sorted.map(c => {
     const d = new Date(c.timestamp||Date.now());
     const when = d.toLocaleString();
@@ -35,7 +61,9 @@ function renderClips() {
     return `<div class="clip-item" style="margin:10px 0;display:flex;flex-direction:column;gap:6px;">`+
       `<div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">`+
         `<a href="${urlEsc}" target="_blank" rel="noopener" style="color:#58a6ff;">${label}</a>`+
-        `<button class="copy-btn" data-url="${urlEsc}" style="padding:2px 8px;border-radius:6px;background:#3a3f44;color:#fff;border:1px solid #555;cursor:pointer;">Copy</button>`+
+        `<button class="copy-btn" data-url="${urlEsc}" style="padding:2px 8px;border-radius:6px;background:#3a3f44;color:#fff;border:1px solid #555;cursor:pointer;">Copy</button>` +
+        ((playMode && playMode !== 'all') ? `\n          <button class="assign-btn" data-url="${urlEsc}" data-user="${playMode}" style="padding:2px 8px;border-radius:6px;background:#5865f2;color:#fff;border:1px solid #3a3f44;cursor:pointer;margin-left:6px;">Assign to selected</button>` : '') +
+        ((playMode && playMode !== 'all') ? `\n          <button class="delete-btn" data-url="${urlEsc}" data-user="${playMode}" style="padding:2px 8px;border-radius:6px;background:#a33;color:#fff;border:1px solid #722;cursor:pointer;margin-left:6px;">Delete</button>` : '') +
         (c.username ? ` <span style="opacity:0.7">by ${c.username}</span>` : '')+
       `</div>`+
       `<audio controls preload="none" controlslist="nodownload noplaybackrate" style="width:100%;max-width:560px;outline:none;">`+
@@ -55,6 +83,17 @@ socket.on('clip_posted', (clip) => {
   clipItems.push(clip);
   if (clipItems.length > 200) clipItems.shift();
   renderClips();
+});
+socket.on('user_clips', (obj) => {
+  if (!obj) return;
+  userClips = obj || {};
+  renderClips();
+});
+socket.on('user_clips_updated', ({ userId, clips }) => {
+  if (!userId) return;
+  userClips[userId] = clips || [];
+  // If the currently selected user was updated, re-render
+  if (playMode === userId) renderClips();
 });
 
 // Copy button handling (event delegation)
@@ -86,6 +125,41 @@ function ensureToast() {
   document.body.appendChild(toastEl);
   return toastEl;
 }
+// Assign button handling: assign currently selected clip to the selected user
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('.assign-btn');
+  if (!btn) return;
+  const url = btn.getAttribute('data-url');
+  const userId = btn.getAttribute('data-user');
+  if (!url || !userId) { showToast('Missing clip or user'); return; }
+  try {
+    const ok = confirm('Assign this clip to the selected user?');
+    if (!ok) return;
+    socket.emit('assign_clip_to_user', { url, userId });
+    showToast('Assigning clip...');
+  } catch (e) { showToast('Failed to assign'); }
+});
+socket.on('assign_result', (res) => {
+  if (!res) return;
+  if (res.ok) showToast('Assigned clip'); else showToast('Assign failed: ' + (res.error || 'unknown'));
+});
+// Delete button handling: remove an assigned clip from a user
+document.addEventListener('click', async (e) => {
+  const btn = e.target.closest('.delete-btn');
+  if (!btn) return;
+  const url = btn.getAttribute('data-url');
+  const userId = btn.getAttribute('data-user');
+  if (!url || !userId) { showToast('Missing clip or user'); return; }
+  try {
+    if (!confirm('Delete this clip assignment for the selected user? This cannot be undone.')) return;
+    socket.emit('remove_user_clip', { userId, url });
+    showToast('Removing clip...');
+  } catch (e) { showToast('Failed to remove'); }
+});
+socket.on('remove_result', (res) => {
+  if (!res) return;
+  if (res.ok) showToast('Removed clip'); else showToast('Remove failed: ' + (res.error || 'unknown'));
+});
 function showToast(msg) {
   const el = ensureToast();
   el.textContent = msg || '';
@@ -356,7 +430,10 @@ socket.on('update', data => {
     const div = document.createElement('div');
     div.className = 'member';
     div.dataset.userid = m.id;
-    div.innerHTML = `<img src="${m.avatar}" alt="avatar">${m.username}`;
+    const count = (userClips[m.id] && Array.isArray(userClips[m.id])) ? userClips[m.id].length : 0;
+    div.innerHTML = `<img src="${m.avatar}" alt="avatar" style="width:32px;height:32px;border-radius:50%;margin-right:8px;">`+
+      `<span style="margin-right:6px;">${m.username}</span>`+
+      `<span style="background:#5865f2;padding:2px 8px;border-radius:12px;font-size:0.85em;opacity:0.95;color:#fff;">${count}</span>`;
     membersDiv.appendChild(div);
   });
   setUserClickHandlers();

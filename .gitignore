@@ -5,3 +5,12 @@ node_modules/
 public/clips/
 models/
 clips-config.json
+
+# Virtualenv
+.venv/
+# Vosk model archives
+*.zip
+# Public uploads (may contain large files)
+public/uploads/
+# Persistent runtime data
+data/

@@ -5,3 +5,4 @@ soundfile
 python-dotenv
 # Optional, not currently used but available
 webrtcvad
+vosk
