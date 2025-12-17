@@ -37,7 +37,18 @@ if ASR_ENGINE == 'vosk':
 else:
     WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "tiny.en")
     print(f"[WHISPER] Loading model: {WHISPER_MODEL}")
-    model = whisper.load_model(WHISPER_MODEL)
+    try:
+        import whisper
+    except Exception as e:
+        print('[WHISPER] `whisper` package not available:', e)
+        print('[WHISPER] Set ASR_ENGINE=vosk or install the `whisper` package in this environment')
+        model = None
+    else:
+        try:
+            model = whisper.load_model(WHISPER_MODEL)
+        except Exception as e:
+            print('[WHISPER] Failed to load model:', e)
+            model = None
 
 # Simple in-memory queue for transcription jobs
 MAX_QUEUE_SIZE = 6
