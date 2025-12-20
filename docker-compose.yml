@@ -1,14 +1,14 @@
 version: "3.9"
 
 services:
-  whisper:
+  asr:
     build:
       context: .
       dockerfile: Dockerfile.whisper
     environment:
-      - WHISPER_MODEL=${WHISPER_MODEL:-tiny.en}
-      # When running whisper service only, ASR_ENGINE can be left as 'whisper'
-      - ASR_ENGINE=${ASR_ENGINE:-whisper}
+      # Run the ASR service in Vosk mode by default for speed
+      - ASR_ENGINE=${ASR_ENGINE:-vosk}
+      - VOSK_MODEL=${VOSK_MODEL:-/app/models/vosk-model-small-en-us-0.15}
     ports:
       - "5005:5005"
 
@@ -17,18 +17,20 @@ services:
       context: .
       dockerfile: Dockerfile
     depends_on:
-      - whisper
+      - asr
     environment:
       # Secrets / runtime values are picked up from the environment or the .env file.
       - DISCORD_TOKEN=${DISCORD_TOKEN}
       - CLIPS_CHANNEL_ID=${CLIPS_CHANNEL_ID}
       - PORT=${PORT:-3000}
-      # ASR configuration: choose 'whisper' or 'vosk'
-      - ASR_ENGINE=${ASR_ENGINE:-whisper}
+      # ASR configuration: choose 'vosk' (default)
+      - ASR_ENGINE=${ASR_ENGINE:-vosk}
       # When using Vosk, point to the model directory available in the container
       - VOSK_MODEL=${VOSK_MODEL:-/app/models/vosk-model-small-en-us-0.15}
-      # URL to the Whisper/Vosk server (internal docker service name 'whisper')
-      - WHISPER_URL=${WHISPER_URL:-http://whisper:5005}
+      # URL to the ASR server (internal docker service name 'asr')
+      - ASR_URL=${ASR_URL:-http://asr:5005}
+      # Backwards-compatible name used in some configs
+      - WHISPER_URL=${WHISPER_URL:-http://asr:5005}
       # Optional: public base URL where the web UI is reachable (used for clip links)
       - CLIPS_BASE_URL=${CLIPS_BASE_URL:-http://localhost:3000}
     ports:

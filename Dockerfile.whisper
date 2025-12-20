@@ -13,7 +13,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 
 COPY whisper_server.py .
 
-ENV WHISPER_MODEL=tiny.en
+# Default environment: point to a Vosk model directory inside the container
+ENV VOSK_MODEL=/app/models/vosk-model-small-en-us-0.15
 EXPOSE 5005
 
 CMD ["python", "whisper_server.py"]

@@ -1,5 +1,4 @@
 flask
-openai-whisper
 numpy
 soundfile
 python-dotenv

@@ -50,10 +50,12 @@ const io = new Server(server);
 // Consolidated environment/config constants
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3000;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN || '';
-const WHISPER_URL = process.env.WHISPER_URL || 'http://localhost:5005/transcribe';
+const ASR_URL = process.env.WHISPER_URL || process.env.ASR_URL || 'http://localhost:5005/transcribe';
 const CLIPS_BASE_URL = process.env.CLIPS_BASE_URL || `http://localhost:${PORT}`;
 const CLIPS_CHANNEL_ID = process.env.CLIPS_CHANNEL_ID || null;
 const KEEP_UPLOADS = process.env.KEEP_UPLOADS === '1';
+// Trigger energy gate: minimum mean-absolute amplitude required to accept a trigger (0..1 scale)
+const TRIGGER_MIN_ENERGY = Number(process.env.TRIGGER_MIN_ENERGY || process.env.TRIGGER_GATE || 0.02);
 
 // Helper: coerce various binary forms into a Node Buffer
 function toNodeBuffer(data) {
@@ -724,23 +726,12 @@ function shouldTriggerClipFromContext(userId) {
   if (now - last < 15000) return false;
   const ctx = getContextText(userId);
   if (!ctx) return false;
-  // Even stricter: only accept exact canonical phrases in the recent context.
-  // This removes adjacency heuristics to minimize false positives.
-  const canonical = [
-    'terry clip that',
-    'okay terry clip that',
-    'ok terry clip that',
-    'terry clip',
-    'terry, clip',
-    'reclip that',
-    're-clip that'
-  ];
-  for (const p of canonical) {
-    if (ctx.includes(p)) {
-      lastClipTriggerByUser.set(userId, now);
-      transcriptHistoryByUser.set(userId, []);
-      return true;
-    }
+  // Only trigger on the exact canonical phrase to avoid false positives.
+  const canonical = 'terry clip that';
+  if (ctx.includes(canonical)) {
+    lastClipTriggerByUser.set(userId, now);
+    transcriptHistoryByUser.set(userId, []);
+    return true;
   }
   return false;
 }
@@ -833,7 +824,7 @@ function joinAndMonitor(channel) {
 
   const receiver = currentConnection.receiver;
   const activeStreams = new Set();
-  const userState = new Map(); // userId -> { name, whisperBuf: Int16Array[], lastSend: number, transcribeQueue: Promise }
+  const userState = new Map(); // userId -> { name, asrBuf: Int16Array[], lastSend: number, transcribeQueue: Promise }
 
   if (monitorInterval) clearInterval(monitorInterval);
   monitorInterval = setInterval(() => {
@@ -855,7 +846,7 @@ function joinAndMonitor(channel) {
       if (!userState.has(userId)) {
         userState.set(userId, {
           name,
-          whisperBuf: [],
+          asrBuf: [],
           lastSend: 0,
           transcribeQueue: Promise.resolve()
         });
@@ -876,17 +867,21 @@ function joinAndMonitor(channel) {
 
           const st = userState.get(userId);
           if (!st) return;
-          for (let i = 0; i < copy.length; i++) st.whisperBuf.push(copy[i]);
-          if (st.whisperBuf.length >= MIN_CHUNK_SAMPLES_STEREO) {
-            let chunk16k = downsampleTo16kMono(Int16Array.from(st.whisperBuf));
+          for (let i = 0; i < copy.length; i++) st.asrBuf.push(copy[i]);
+          if (st.asrBuf.length >= MIN_CHUNK_SAMPLES_STEREO) {
+            let chunk16k = downsampleTo16kMono(Int16Array.from(st.asrBuf));
             chunk16k = normalizeToTargetRms(chunk16k, 0.1, 6.0);
-            st.whisperBuf = st.whisperBuf.slice(MIN_CHUNK_SAMPLES_STEREO);
+            st.asrBuf = st.asrBuf.slice(MIN_CHUNK_SAMPLES_STEREO);
             const audioBuffer = Buffer.from(chunk16k.buffer);
             const userName = st.name;
             // For short chunks used to detect voice-trigger commands, send a narrow grammar
-            const triggerGrammar = JSON.stringify(["terry clip that","terry clip","clip that","re-clip that","okay terry clip that"]);
+            const triggerGrammar = JSON.stringify(["terry clip that"]);
+            // Compute a simple mean-absolute energy for this trigger chunk and gate on it
+            let triggerEnergy = 0;
+            for (let i = 0; i < chunk16k.length; i++) triggerEnergy += Math.abs(chunk16k[i]);
+            triggerEnergy = triggerEnergy / Math.max(1, chunk16k.length);
             st.transcribeQueue = st.transcribeQueue.then(() =>
-              axios.post(WHISPER_URL, audioBuffer, {
+              axios.post(ASR_URL, audioBuffer, {
                 headers: { 'Content-Type': 'application/octet-stream', 'X-ASR-GRAMMAR': triggerGrammar },
                 timeout: 20000
               }).then(res => {
@@ -895,7 +890,8 @@ function joinAndMonitor(channel) {
                   if (!transcriptText) return;
                   io.emit('transcript', { userId, username: userName, text: transcriptText, timestamp: Date.now() });
                   appendTranscriptContext(userId, transcriptText);
-                  if (shouldTriggerClipFromContext(userId)) {
+                  // Only trigger if contextual check passes and energy is above gate
+                  if (shouldTriggerClipFromContext(userId) && triggerEnergy >= TRIGGER_MIN_ENERGY) {
                     handleVoiceClipCommand(userName, userId);
                   }
                 }
@@ -903,14 +899,14 @@ function joinAndMonitor(channel) {
           }
 
           if (!st.lastSend || Date.now() - st.lastSend > TRANSCRIBE_FLUSH_MS) {
-            if (st.whisperBuf.length > (STEREO_INT16_SAMPLES_PER_SEC * 0.6)) {
-              let chunk16k = downsampleTo16kMono(Int16Array.from(st.whisperBuf));
+            if (st.asrBuf.length > (STEREO_INT16_SAMPLES_PER_SEC * 0.6)) {
+              let chunk16k = downsampleTo16kMono(Int16Array.from(st.asrBuf));
               chunk16k = normalizeToTargetRms(chunk16k, 0.1, 6.0);
-              st.whisperBuf = [];
+              st.asrBuf = [];
               const audioBuffer = Buffer.from(chunk16k.buffer);
               const userName = st.name;
               st.transcribeQueue = st.transcribeQueue.then(() =>
-                axios.post(WHISPER_URL, audioBuffer, {
+                axios.post(ASR_URL, audioBuffer, {
                   headers: { 'Content-Type': 'application/octet-stream' },
                   timeout: 20000
                 }).then(res => {
@@ -933,7 +929,7 @@ function joinAndMonitor(channel) {
       decoder.on('error', () => { activeStreams.delete(userId); });
     }
   }, 2000);
-  // Note: This implementation focuses on per-user buffers and Whisper streaming.
+  // Note: This implementation focuses on per-user buffers and ASR streaming.
 }
 
 // (No client-side repetition collapsing; show raw model output).
@@ -1166,7 +1162,7 @@ client.on('messageCreate', async (message) => {
         '- -clipbots: Server owner only, toggle including bot users in recorded clips',
         '',
         '**Voice trigger (strict)**',
-        '- Say "terry clip that" (or short variants) to create a 30s clip. Trigger detection is intentionally strict to avoid false positives.',
+        '- Say "terry clip that" to create a 30s clip. Trigger detection is intentionally strict to avoid false positives.',
       ].join('\n');
       try { await message.reply(helpText); } catch (_) {}
       return;

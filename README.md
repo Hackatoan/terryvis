@@ -1,6 +1,6 @@
 # TerryVis
 
-A Discord voice bot that streams audio to a web UI, transcribes speech using a local Whisper server, and creates 30s clips via command or voice triggers.
+A Discord voice bot that streams audio to a web UI, transcribes speech using a local Vosk-based ASR server, and creates 30s clips via command or voice triggers.
 
 ## Features
 - Joins the most active voice channel and streams audio to the browser
@@ -10,7 +10,7 @@ A Discord voice bot that streams audio to a web UI, transcribes speech using a l
   - `-clip`
   - `-dmtoggle`
   - `-setclip <channel_id|#mention>` (server owner only)
-- Voice triggers with fuzzy recognition (e.g., "terry clip that", "okay terry clip that", "re-clip that", and common ASR miss-hears like "club that")
+ - Voice trigger: say exactly "terry clip that" to create a clip (detection is strict).
 - Clips posted to DM if toggled, or to configured clip channel; files are deleted after posting
 
 ## Requirements
@@ -39,8 +39,8 @@ Copy `.env.example` to `.env` and fill in at least `DISCORD_TOKEN`.
 Optional variables:
 - `CLIPS_CHANNEL_ID` (default target unless set via `-setclip`)
 - `PORT` (web UI, default 3000)
-- `WHISPER_URL` (defaults to http://127.0.0.1:5005; server also accepts `/transcribe`)
-- `WHISPER_MODEL` (for the Python server; default tiny.en)
+ - `WHISPER_URL` / `ASR_URL` (defaults to http://127.0.0.1:5005; server also accepts `/transcribe`)
+ - `VOSK_MODEL` (for the Python server; default ./models/vosk-model-small-en-us-0.15)
 
 4. Python deps
 
@@ -52,7 +52,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-5. Start the Whisper server
+5. Start the ASR server (Vosk)
 
 ```bash
 python whisper_server.py
@@ -60,7 +60,7 @@ python whisper_server.py
 
 - It will start on `http://localhost:5005` and expose `POST /transcribe`.
 - The server also accepts `POST /` as an alias and supports `.env` via `python-dotenv`.
-- Adjust the model with `WHISPER_MODEL` (e.g., `base.en`, `small.en`).
+- Point `VOSK_MODEL` at a downloaded Vosk model directory (see below).
 
 6. Start the bot + web UI
 
@@ -103,8 +103,8 @@ Trigger behavior (stricter by default)
 Run both services with Docker:
 
 1. Create a `.env` in the project root with at least `DISCORD_TOKEN`.
-  - Optional: `CLIPS_CHANNEL_ID`, `PORT` (for web UI), `WHISPER_URL`, `WHISPER_MODEL`.
-  - When using Docker Compose, `WHISPER_URL` defaults to `http://whisper:5005`.
+  - Optional: `CLIPS_CHANNEL_ID`, `PORT` (for web UI), `ASR_URL`/`WHISPER_URL`, `VOSK_MODEL`.
+  - When using Docker Compose, `ASR_URL`/`WHISPER_URL` defaults to `http://asr:5005`.
 
 2. Start with Compose:
 
@@ -113,14 +113,14 @@ docker compose up --build
 ```
 
 Services:
-- whisper: Python Whisper server on port 5005 (exposed)
+- asr: Python Vosk ASR server on port 5005 (exposed)
 - bot: Node bot + web UI on port 3000 (exposed)
 
 The clips folder is mounted at `./public/clips` for persistence.
 
-- If you see 404s on the Whisper server, ensure the bot `WHISPER_URL` points to `/transcribe` or use the root alias (`/`).
-- Ensure your bot token is correct and that the bot is not blocked by server permissions.
-- For better transcription quality, try `WHISPER_MODEL=base.en` (or higher) and ensure CPU resources are sufficient.
+ - If you see 404s on the ASR server, ensure the bot `ASR_URL` (or `WHISPER_URL` for backward compatibility) points to `/transcribe` or use the root alias (`/`).
+ - Ensure your bot token is correct and that the bot is not blocked by server permissions.
+ - For better transcription quality with Vosk, try a larger Vosk model (if available) or tune the grammar and noise-gate thresholds.
 
 Docker notes and quick setup
 
@@ -128,9 +128,8 @@ Docker notes and quick setup
 
 ```dotenv
 DISCORD_TOKEN=your-bot-token
-ASR_ENGINE=vosk       # or 'whisper'
+ASR_ENGINE=vosk
 VOSK_MODEL=./models/vosk-model-small-en-us-0.15
-WHISPER_MODEL=tiny.en
 CLIPS_CHANNEL_ID=
 PORT=3000
 ```
@@ -150,13 +149,13 @@ cd ..
 docker compose up --build
 ```
 
-- To run only the bot with Vosk pointing to a local model (no Whisper service), set `ASR_ENGINE=vosk` and ensure `VOSK_MODEL` points to a valid model path on the host. You can also remove the `whisper` service from the compose file if desired.
+To run only the bot with a locally-mounted Vosk model (no ASR container), set `ASR_ENGINE=vosk` and ensure `VOSK_MODEL` points to a valid model path on the host. The compose file uses the `asr` service name by default; remove or adapt it if you prefer a single-container setup.
 
-### Faster / lower-resource ASR (optional)
+### Faster / lower-resource ASR (Vosk)
 
-If Whisper is too slow on your host, you can switch to a lighter offline ASR engine: Vosk. Vosk has small English models that run faster on CPUs and work well for short voice commands.
+This project uses Vosk by default for faster, lower-resource transcription. Vosk has small English models that run faster on CPUs and work well for short voice commands.
 
-- Install Vosk and a small English model:
+Install Vosk and a small English model:
 
 ```bash
 pip install vosk
@@ -167,12 +166,42 @@ unzip vosk-model-small-en-us-0.15.zip
 cd ..
 ```
 
-- Set environment variables before starting the Python server/bot:
+Set environment variables before starting the ASR server/bot:
 
 ```bash
-export ASR_ENGINE=vosk
 export VOSK_MODEL=./models/vosk-model-small-en-us-0.15
 python whisper_server.py
 ```
 
-This project supports `ASR_ENGINE=whisper` (default) and `ASR_ENGINE=vosk` (faster). Vosk trades some accuracy for speed but is generally more responsive for short spoken commands.
+Vosk trades some accuracy for speed but is generally more responsive for short spoken commands.
+
+## Improving Vosk accuracy (practical options)
+
+If you want a step-up in accuracy, here are the most effective options (ordered by impact):
+
+- Use a larger Vosk model (recommended): replace the small model with a medium/large English model. Larger models are noticeably more accurate at the cost of CPU and RAM. Example (host):
+
+```bash
+mkdir -p models && cd models
+# medium model (example name — consult Vosk downloads for exact names/URLs)
+wget https://alphacephei.com/vosk/models/vosk-model-medium-en-us-0.22.zip
+unzip vosk-model-medium-en-us-0.22.zip
+cd ..
+export VOSK_MODEL=./models/vosk-model-medium-en-us-0.22
+python whisper_server.py
+```
+
+- Tune the bot energy gate: `TRIGGER_MIN_ENERGY` (env or `.env`) avoids firing on low-energy audio. Raise it (e.g. `0.03`–`0.06`) to reduce accidental triggers, lower it to be more permissive.
+
+- Grammar-focused detection: for short command-spotting keep a narrow grammar (we already use `["terry clip that"]`). If you want slightly more robustness, you can expand the grammar with carefully chosen variants (but that increases false-positive risk).
+
+- Advanced Vosk decoder tuning: Vosk/Kaldi expose decoder parameters such as beam and max-active which can improve accuracy at the cost of CPU. These are not always exposed directly in the simple Python wrapper; however you can experiment with these environment variables (some builds read them) or run a custom container that sets them. Example envs (documented in `.env.example`):
+
+```
+VOSK_BEAM=15
+VOSK_MAX_ACTIVE=7000
+```
+
+Note: changing decoder internals may require rebuilding Vosk or running a different Vosk runtime image; the fastest, most reliable step is to switch to a larger model.
+
+If you'd like, I can download a medium model into `./models`, update `VOSK_MODEL` in your `.env`, and restart the ASR server here so you can test accuracy immediately. This will use more disk and CPU.
