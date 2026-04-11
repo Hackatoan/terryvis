@@ -2,19 +2,18 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system deps for soundfile
-RUN apt-get update && apt-get install -y --no-install-recommends libsndfile1 ffmpeg \
+# Install system deps for soundfile and webrtcvad
+RUN apt-get update && apt-get install -y --no-install-recommends libsndfile1 ffmpeg build-essential \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-RUN apt-get update && apt-get install -y --no-install-recommends build-essential \
-    && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir -r requirements.txt
+ENV SETUPTOOLS_USE_DISTUTILS=stdlib
+RUN pip install --no-cache-dir -r requirements.txt
 
 COPY whisper_server.py .
 
-# Default environment: point to a Vosk model directory inside the container
-ENV VOSK_MODEL=/app/models/vosk-model-small-en-us-0.15
+# Optional model ENV var for faster-whisper (e.g. tiny.en, base.en, small.en)
+ENV WHISPER_MODEL=base.en
 EXPOSE 5005
 
 CMD ["python", "whisper_server.py"]
