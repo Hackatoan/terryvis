@@ -66,7 +66,7 @@ class AsrClient {
       if (userObj && userObj.bot) return;
 
       const decoder = new prism.opus.Decoder({ rate: 48000, channels: 2, frameSize: 960 });
-      const stream = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: 200 } });
+      const stream = receiver.subscribe(userId, { end: { behavior: EndBehaviorType.AfterSilence, duration: 500 } });
 
       const st = {
         name: userObj ? userObj.username : userId,
@@ -90,17 +90,20 @@ class AsrClient {
         }
       });
 
-      // Simple periodic flush to ASR
-      const asrInterval = setInterval(() => {
-        const st = state.activeStreams.get(userId);
-        if (!st) { clearInterval(asrInterval); return; }
+
+      decoder.on('end', () => {
+        const finalSt = state.activeStreams.get(userId);
+        state.activeStreams.delete(userId);
+
+        if (!finalSt || finalSt.asrBuf.length < (STEREO_INT16_SAMPLES_PER_SEC * 0.2)) {
+           return;
+        }
+
+        const st = finalSt;
 
         try {
-          // If enough audio accumulated or silence ended
-          if (st.asrBuf.length > (STEREO_INT16_SAMPLES_PER_SEC * 0.6)) {
             let chunk16k = downsampleTo16kMono(Int16Array.from(st.asrBuf));
             chunk16k = normalizeToTargetRms(chunk16k, 0.1, 6.0);
-            st.asrBuf = [];
             const audioBuffer = Buffer.from(chunk16k.buffer);
             const userName = st.name;
             const triggerGrammar = '["terry clip that"]'; // For Vosk
@@ -122,19 +125,15 @@ class AsrClient {
                   state.transcriptHistoryByUser.set(userId, hist);
 
                   if (this.guildManager.shouldTriggerClipFromContext(guildId, userId)) {
-                      // Note: Target user not handled in voice trigger, defaults to requester
                       this.guildManager.handleVoiceClipCommand(guildId, userName, userId, null, null, state.currentChannelId);
                   }
                 }
               }).catch(() => {})
             );
-            st.lastSend = Date.now();
-          }
         } catch (_) {}
-      }, 1000);
+      });
 
-      decoder.on('end', () => { clearInterval(asrInterval); state.activeStreams.delete(userId); });
-      decoder.on('error', () => { clearInterval(asrInterval); state.activeStreams.delete(userId); });
+      decoder.on('error', () => { state.activeStreams.delete(userId); });
     }
   }
 }
