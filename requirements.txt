@@ -2,6 +2,6 @@ flask
 numpy
 soundfile
 python-dotenv
-# Optional, not currently used but available
 webrtcvad
-vosk
+faster-whisper
+setuptools==69.5.1
