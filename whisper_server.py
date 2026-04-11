@@ -36,7 +36,7 @@ vad = webrtcvad.Vad()
 vad.set_mode(2) # 0 is least aggressive, 3 is most aggressive about filtering out non-speech
 
 def frame_generator(frame_duration_ms, audio, sample_rate):
-    n = int(sample_rate * (frame_duration_ms / 1000.0))
+    n = int(sample_rate * (frame_duration_ms / 1000.0) * 2)
     offset = 0
     while offset + n <= len(audio):
         yield audio[offset:offset + n]

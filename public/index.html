@@ -19,16 +19,20 @@
     <p>Click the button below to allow the website to play audio from Discord.</p>
     <button id="connect-btn" style="font-size:1.2em;padding:0.7em 2em;border-radius:8px;background:#5865f2;color:#fff;border:none;cursor:pointer;">Connect</button>
   </div>
-  <div class="container" id="main-content" style="filter:blur(2px);pointer-events:none;">
-  <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
-    <div class="channel" id="channel">Loading...</div>
-    <button id="clip-btn" title="Create a 30s clip" style="padding:6px 12px;border-radius:8px;background:#5865f2;color:#fff;border:none;cursor:pointer;">Clip 30s</button>
-  </div>
-  <div class="members" id="members"></div>
-  <div id="transcript" style="margin-top:24px;background:#23272a;padding:12px 16px;border-radius:8px;min-height:48px;max-height:200px;overflow-y:auto;font-size:1.05em;"></div>
-  <div id="clips" style="margin-top:24px;background:#23272a;padding:12px 16px;border-radius:8px;min-height:48px;max-height:260px;overflow-y:auto;font-size:1.0em;"></div>
-  <div id="audio-streams"></div>
-  </div>
+  <div id="guilds-container" style="filter:blur(2px);pointer-events:none;"></div>
+
+  <template id="guild-template">
+    <div class="container guild-container">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;">
+        <div class="channel guild-channel">Loading...</div>
+        <button class="clip-btn" title="Create a 30s clip" style="padding:6px 12px;border-radius:8px;background:#5865f2;color:#fff;border:none;cursor:pointer;">Clip 30s</button>
+      </div>
+      <div class="members guild-members"></div>
+      <div class="guild-transcript" style="margin-top:24px;background:#23272a;padding:12px 16px;border-radius:8px;min-height:48px;max-height:200px;overflow-y:auto;font-size:1.05em;"></div>
+      <div class="guild-clips" style="margin-top:24px;background:#23272a;padding:12px 16px;border-radius:8px;min-height:48px;max-height:260px;overflow-y:auto;font-size:1.0em;"></div>
+      <div class="guild-audio-streams"></div>
+    </div>
+  </template>
   <div class="container" style="max-width:600px;margin-top:12px;background:#25282c;">
     <div style="font-size:1.2em;margin-bottom:8px;">Play audio into Discord</div>
     <div id="play-panel" style="display:flex;flex-direction:column;gap:10px;">
@@ -43,8 +47,8 @@
   <script>
     document.getElementById('connect-btn').onclick = function() {
       document.getElementById('connect-overlay').style.display = 'none';
-      document.getElementById('main-content').style.filter = '';
-      document.getElementById('main-content').style.pointerEvents = '';
+      document.getElementById('guilds-container').style.filter = '';
+      document.getElementById('guilds-container').style.pointerEvents = '';
       // Resume audio context if needed
       if (window.audioCtx && window.audioCtx.state === 'suspended') {
         window.audioCtx.resume();

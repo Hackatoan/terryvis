@@ -307,7 +307,7 @@ class GuildManager {
       if (!userClips[userId]) userClips[userId] = [];
       userClips[userId].push({ url, timestamp: Date.now(), title: title || '' });
       saveUserClips();
-      this.webUI.emitToAll('user_clips_updated', { userId, clips: userClips[userId] });
+      this.webUI.emitToAll('user_clips_updated', { guildId, userId, clips: userClips[userId] });
   }
 
   getUserClips(userId) {
@@ -448,7 +448,7 @@ class GuildManager {
 
               if (postedUrl) {
                   this.addUserClip(actualTargetUserId, titleOptional, postedUrl, guildId);
-                  this.webUI.emitToAll('clip_posted', { url: postedUrl, filename, requestedBy: requestedByName, title: titleOptional });
+                  this.webUI.emitToAll('clip_posted', { guildId, url: postedUrl, filename, requestedBy: requestedByName, title: titleOptional });
               }
 
               if (!KEEP_UPLOADS && fs.existsSync(filepath)) {
