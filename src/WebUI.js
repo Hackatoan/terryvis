@@ -40,7 +40,7 @@ class WebUI {
     if (channel) {
       currentMembers = Array.from(channel.members.values()).map(m => ({
         id: m.id,
-        name: m.user.username,
+        username: m.user.username,
         bot: m.user.bot,
         avatar: m.user.displayAvatarURL({ format: 'png', size: 64 })
       }));

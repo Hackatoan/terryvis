@@ -14,3 +14,4 @@ clips-config.json
 public/uploads/
 # Persistent runtime data
 data/
+venv/

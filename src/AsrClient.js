@@ -114,7 +114,7 @@ class AsrClient {
                   const transcriptText = String(res.data.text || '').trim();
                   if (!transcriptText) return;
 
-                  this.webUI.emitToAll('transcript', { userId, username: userName, text: transcriptText, timestamp: Date.now() });
+                  this.webUI.emitToAll('transcript', { guildId, userId, username: userName, text: transcriptText, timestamp: Date.now() });
 
                   const hist = state.transcriptHistoryByUser.get(userId) || [];
                   hist.push(transcriptText);
