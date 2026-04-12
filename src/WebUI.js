@@ -25,6 +25,12 @@ class WebUI {
   setupSocketIO() {
     this.io.on('connection', (socket) => {
       console.log('[web] client connected');
+
+      socket.on('play_upload', (payload) => {
+        if (this.onPlayUpload) {
+          this.onPlayUpload(payload, socket);
+        }
+      });
     });
   }
 
