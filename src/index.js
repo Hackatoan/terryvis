@@ -1,4 +1,6 @@
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const { Client, GatewayIntentBits } = require('discord.js');
 const WebUI = require('./WebUI');
 const GuildManager = require('./GuildManager');
@@ -18,6 +20,38 @@ const client = new Client({
 const webUI = new WebUI();
 const guildManager = new GuildManager(client, webUI);
 const commandManager = new CommandManager(client, guildManager, webUI);
+
+webUI.onPlayUpload = (payload, socket) => {
+  if (!payload.guildId || !payload.data) {
+    socket.emit('play_error', 'Invalid play request');
+    return;
+  }
+  try {
+    const upDir = path.join(__dirname, '..', 'public', 'uploads');
+    if (!fs.existsSync(upDir)) fs.mkdirSync(upDir, { recursive: true });
+
+    const ext = (payload.name && payload.name.includes('.')) ? payload.name.split('.').pop() : 'bin';
+    const filename = `upload-${Date.now()}.${ext}`;
+    const filepath = path.join(upDir, filename);
+
+    // Write array buffer to file
+    const buf = Buffer.from(payload.data);
+    fs.writeFileSync(filepath, buf);
+
+    const url = `/uploads/${filename}`;
+    socket.emit('play_saved', { url, name: payload.name || filename });
+
+    socket.emit('play_started');
+    guildManager.playFileFromDisk(payload.guildId, filepath,
+      () => { console.log(`[web] playing file ${filename} in guild ${payload.guildId}`); },
+      () => { socket.emit('play_ended'); },
+      (err) => { socket.emit('play_error', err.message); }
+    );
+  } catch (e) {
+    console.error('Error handling upload:', e);
+    socket.emit('play_error', 'Upload handling failed');
+  }
+};
 
 client.on('ready', () => {
   console.log(`[discord] Logged in as ${client.user.tag}`);

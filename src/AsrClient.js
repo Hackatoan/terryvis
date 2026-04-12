@@ -81,6 +81,7 @@ class AsrClient {
       decoder.on('data', chunk => {
         const buf = toNodeBuffer(chunk);
         if (!buf) return;
+        this.webUI.emitToAll('audio', { userId, data: buf.toString('base64') });
         const pcm = new Int16Array(buf.buffer, buf.byteOffset, buf.length / 2);
         this.guildManager.writeToUserRing(guildId, userId, pcm);
 

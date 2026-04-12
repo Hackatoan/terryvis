@@ -206,6 +206,16 @@ socket.on('update', data => {
   if (!g) return;
 
   g.channelEl.textContent = `Channel: ${data.channel.name}`;
+  const guildSelect = document.getElementById('guild-selector');
+  if (guildSelect) {
+    let option = guildSelect.querySelector(`option[value="${guildId}"]`);
+    if (!option) {
+      option = document.createElement('option');
+      option.value = guildId;
+      guildSelect.appendChild(option);
+    }
+    option.textContent = `${data.channel.name} (${guildId})`;
+  }
   g.membersEl.innerHTML = '';
 
   (data.members || []).forEach(m => {
@@ -278,7 +288,10 @@ document.addEventListener('DOMContentLoaded', () => {
       try { if (audioCtx && audioCtx.state === 'suspended') await audioCtx.resume(); } catch (_) {}
       try {
         const arrBuf = await f.arrayBuffer();
-        socket.emit('play_upload', { data: new Uint8Array(arrBuf), mime: f.type || 'application/octet-stream', name: f.name || 'upload' });
+        const guildSelect = document.getElementById('guild-selector');
+        const selectedGuildId = guildSelect ? guildSelect.value : null;
+        if (!selectedGuildId) { setStatus('Please select a server first.'); return; }
+        socket.emit('play_upload', { data: new Uint8Array(arrBuf), mime: f.type || 'application/octet-stream', name: f.name || 'upload', guildId: selectedGuildId });
         setStatus('Playing...');
       } catch (e) { setStatus('Failed to send play request.'); }
     });
@@ -423,6 +436,16 @@ socket.on('update', data => {
   if (!g) return;
 
   g.channelEl.textContent = `Channel: ${data.channel.name}`;
+  const guildSelect = document.getElementById('guild-selector');
+  if (guildSelect) {
+    let option = guildSelect.querySelector(`option[value="${guildId}"]`);
+    if (!option) {
+      option = document.createElement('option');
+      option.value = guildId;
+      guildSelect.appendChild(option);
+    }
+    option.textContent = `${data.channel.name} (${guildId})`;
+  }
   g.membersEl.innerHTML = '';
 
   (data.members || []).forEach(m => {

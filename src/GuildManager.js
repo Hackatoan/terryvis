@@ -435,7 +435,7 @@ class GuildManager {
                       try {
                           const destChan = guild.channels.cache.get(targetChannelId);
                           if (destChan && typeof destChan.send === 'function') {
-                              const titleLine = titleOptional ? `\n**Title:** ${titleOptional}` : '';
+                              const titleLine = titleOptional ? ` - ${titleOptional}` : '';
                               const msg = await destChan.send({
                                   content: `🎬 **${requestedByName}** clipped the last 30s!${titleLine}`,
                                   files: [filepath]
