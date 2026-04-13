@@ -346,17 +346,7 @@ class GuildManager {
         try { state.currentConnection.subscribe(state.currentPlayer); } catch (_) {}
       }
 
-      const ff = spawn('ffmpeg', [
-        '-hide_banner', '-loglevel', 'error', '-nostdin',
-        '-re', '-i', filePath,
-        '-vn', '-sn', '-dn',
-        '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'
-      ], { stdio: ['ignore', 'pipe', 'pipe'] });
-
-      const pcm = ff.stdout;
-      const enc = new prism.opus.Encoder({ rate: 48000, channels: 2, frameSize: 960 });
-      const opus = pcm.pipe(enc);
-      const resource = createAudioResource(opus, { inputType: StreamType.Opus });
+      const resource = createAudioResource(filePath);
 
       const started = () => { onStart && onStart(); try { state.currentPlayer.off(AudioPlayerStatus.Playing, started); } catch (_) {} };
       const ended = () => { onEnd && onEnd(); try { state.currentPlayer.off(AudioPlayerStatus.Idle, ended); } catch (_) {} };
