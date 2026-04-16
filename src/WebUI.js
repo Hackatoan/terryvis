@@ -26,6 +26,12 @@ class WebUI {
     this.io.on('connection', (socket) => {
       console.log('[web] client connected');
 
+      socket.on('set_clip_channel', (payload) => {
+        if (this.onSetClipChannel) {
+          this.onSetClipChannel(payload, socket);
+        }
+      });
+
       socket.on('play_upload', (payload) => {
         if (this.onPlayUpload) {
           this.onPlayUpload(payload, socket);
@@ -41,6 +47,16 @@ class WebUI {
   }
 
   updateWebMembers(channel, guildId) {
+    let textChannels = [];
+    let clipChannelId = null;
+    if (this.guildManager && channel) {
+        textChannels = Array.from(channel.guild.channels.cache.values())
+            .filter(c => c.type === 0)
+            .map(c => ({ id: c.id, name: c.name }));
+        const config = this.guildManager.getConfig(channel.guild.id);
+        clipChannelId = config.clipChannelId || null;
+    }
+
     let currentMembers = [];
     let channelObj = null;
     if (channel) {
@@ -55,7 +71,9 @@ class WebUI {
     // We emit guild-specific updates. Clients can filter based on guildId if needed.
     this.io.emit('update', {
       channel: channelObj,
-      members: currentMembers
+      members: currentMembers,
+      textChannels,
+      clipChannelId
     });
   }
 
