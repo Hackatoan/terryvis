@@ -27,6 +27,7 @@ function getGuildContainer(guildId) {
   const transcriptEl = container.querySelector('.guild-transcript');
   const clipsEl = container.querySelector('.guild-clips');
   const clipBtn = container.querySelector('.clip-btn');
+  const clipChannelSelector = container.querySelector('.clip-channel-selector');
 
   document.getElementById('guilds-container').appendChild(container);
 
@@ -36,6 +37,12 @@ function getGuildContainer(guildId) {
 
   guildContainers[guildId] = g;
   guildClipsData[guildId] = [];
+
+  if (clipChannelSelector) {
+    clipChannelSelector.addEventListener('change', (e) => {
+      socket.emit('set_clip_channel', { guildId, channelId: e.target.value });
+    });
+  }
 
   if (clipBtn) {
     clipBtn.addEventListener('click', () => {
@@ -206,6 +213,26 @@ socket.on('update', data => {
   if (!g) return;
 
   g.channelEl.textContent = `Channel: ${data.channel.name}`;
+
+  const clipChannelSelector = g.container.querySelector('.clip-channel-selector');
+  if (clipChannelSelector && data.textChannels) {
+    const currentVal = clipChannelSelector.value;
+    clipChannelSelector.innerHTML = '<option value="">Default Clip Channel</option>';
+    data.textChannels.forEach(c => {
+      const opt = document.createElement('option');
+      opt.value = c.id;
+      opt.textContent = c.name;
+      clipChannelSelector.appendChild(opt);
+    });
+    if (data.clipChannelId) {
+      clipChannelSelector.value = data.clipChannelId;
+    } else if (currentVal) {
+      // keep current selection if valid
+      if (data.textChannels.find(c => c.id === currentVal)) {
+        clipChannelSelector.value = currentVal;
+      }
+    }
+  }
   const guildSelect = document.getElementById('guild-selector');
   if (guildSelect) {
     let option = guildSelect.querySelector(`option[value="${guildId}"]`);

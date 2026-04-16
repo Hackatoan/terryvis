@@ -19,7 +19,20 @@ const client = new Client({
 
 const webUI = new WebUI();
 const guildManager = new GuildManager(client, webUI);
+webUI.guildManager = guildManager;
 const commandManager = new CommandManager(client, guildManager, webUI);
+
+webUI.onSetClipChannel = (payload, socket) => {
+  if (payload.guildId && payload.channelId !== undefined) {
+    guildManager.setConfig(payload.guildId, 'clipChannelId', payload.channelId || null);
+    console.log(`[web] clip channel for ${payload.guildId} set to ${payload.channelId}`);
+    // broadcast update
+    const g = guildManager.guilds.get(payload.guildId);
+    if (g && g.channel) {
+      webUI.updateWebMembers(g.channel, payload.guildId);
+    }
+  }
+};
 
 webUI.onPlayUpload = (payload, socket) => {
   if (!payload.guildId || !payload.data) {
