@@ -443,54 +443,5 @@ function resetJitter() {
 }
 
 
-socket.on('transcript', (data) => {
-  if (!data || !data.guildId) return;
-  const g = getGuildContainer(data.guildId);
-  if (!g) return;
-  const div = document.createElement('div');
-  div.style.marginBottom = '6px';
-  const safeName = String(data.username || 'Unknown').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  const safeText = String(data.text || '').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  div.innerHTML = `<strong style="color:#5865f2;">${safeName}:</strong> <span style="color:#dcddde;">${safeText}</span>`;
-  g.transcriptEl.appendChild(div);
-  g.transcriptEl.scrollTop = g.transcriptEl.scrollHeight;
-});
 
-socket.on('update', data => {
-  if (!data || !data.channel || !data.channel.guildId) return;
-  const guildId = data.channel.guildId;
-  const g = getGuildContainer(guildId);
-  if (!g) return;
 
-  g.channelEl.textContent = `Channel: ${data.channel.name}`;
-  const guildSelect = document.getElementById('guild-selector');
-  if (guildSelect) {
-    let option = guildSelect.querySelector(`option[value="${guildId}"]`);
-    if (!option) {
-      option = document.createElement('option');
-      option.value = guildId;
-      guildSelect.appendChild(option);
-    }
-    option.textContent = `${data.channel.name} (${guildId})`;
-  }
-  g.membersEl.innerHTML = '';
-
-  (data.members || []).forEach(m => {
-    const div = document.createElement('div');
-    div.className = 'member';
-    div.dataset.userid = m.id;
-    const count = 0; // Simplified
-    div.innerHTML = `<img src="${m.avatar}" alt="avatar" style="width:32px;height:32px;border-radius:50%;margin-right:8px;">`+
-      `<span style="margin-right:6px;">${m.username}</span>`+
-      `<span style="background:#5865f2;padding:2px 8px;border-radius:12px;font-size:0.85em;opacity:0.95;color:#fff;display:none;">${count}</span>`;
-    g.membersEl.appendChild(div);
-  });
-
-  setUserClickHandlers(g);
-
-  if (g.playMode !== 'all') {
-    const stillPresent = (data.members || []).some(m => m.id === g.playMode);
-    if (!stillPresent) g.playMode = 'all';
-  }
-  updateSelectionStyles(g);
-});
