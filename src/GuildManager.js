@@ -249,57 +249,60 @@ class GuildManager {
     const state = this.getGuildState(guildId);
     let ring = state.userRings.get(userId);
     if (!ring) {
-      ring = { buffer: new Int16Array(TOTAL_CLIP_SAMPLES), writeIndex: 0, filled: 0, lastWriteTimeMs: 0, lastEndMs: 0, chunks: [] };
+      ring = { buffer: new Int16Array(TOTAL_CLIP_SAMPLES), lastWriteTimeMs: 0 };
       state.userRings.set(userId, ring);
     }
     const buf = ring.buffer;
-    let idx = ring.writeIndex;
-    for (let i = 0; i < pcm16Stereo.length; i++) {
-      buf[idx] = pcm16Stereo[i];
-      idx = (idx + 1) % TOTAL_CLIP_SAMPLES;
-    }
-    ring.writeIndex = idx;
-    ring.filled = Math.min(ring.filled + pcm16Stereo.length, TOTAL_CLIP_SAMPLES);
     const now = Date.now();
-    ring.lastWriteTimeMs = now;
-    ring.lastEndMs = now;
-    ring.chunks.push({ endMs: now, sampleCount: pcm16Stereo.length });
+    const pcmSamples = pcm16Stereo.length;
 
-    // prune chunks
-    const cutoff = now - (CLIP_SECONDS * 1000);
-    while (ring.chunks.length > 0 && ring.chunks[0].endMs < cutoff) {
-      ring.chunks.shift();
+    // 96 samples per ms for 48000Hz stereo
+    const endIndex = Math.floor(now * 96) % TOTAL_CLIP_SAMPLES;
+    let startIndex = (endIndex - pcmSamples + TOTAL_CLIP_SAMPLES) % TOTAL_CLIP_SAMPLES;
+
+    for (let i = 0; i < pcmSamples; i++) {
+      buf[(startIndex + i) % TOTAL_CLIP_SAMPLES] = pcm16Stereo[i];
     }
+
+    if (ring.lastWriteTimeMs > 0) {
+      const gapMs = now - (pcmSamples / 96) - ring.lastWriteTimeMs;
+      if (gapMs > 0) {
+        let gapSamplesToClear = Math.floor(gapMs * 96);
+        if (gapSamplesToClear > TOTAL_CLIP_SAMPLES) gapSamplesToClear = TOTAL_CLIP_SAMPLES;
+        let clearStartIndex = Math.floor(ring.lastWriteTimeMs * 96) % TOTAL_CLIP_SAMPLES;
+        for (let i = 0; i < gapSamplesToClear; i++) {
+          buf[(clearStartIndex + i) % TOTAL_CLIP_SAMPLES] = 0;
+        }
+      }
+    }
+    ring.lastWriteTimeMs = now;
   }
 
   getLast30sMix(guildId, userIds) {
     const state = this.getGuildState(guildId);
     const result = new Int16Array(TOTAL_CLIP_SAMPLES);
     const now = Date.now();
-    const cutoff = now - (CLIP_SECONDS * 1000);
+    const cutoffMs = now - (CLIP_SECONDS * 1000);
+    const endIndex = Math.floor(now * 96) % TOTAL_CLIP_SAMPLES;
 
     let mixedCount = 0;
     for (const uid of userIds) {
       const ring = state.userRings.get(uid);
-      if (!ring || ring.filled === 0) continue;
+      if (!ring) continue;
+      if (ring.lastWriteTimeMs < cutoffMs) continue;
 
-      let validSamples = 0;
-      for (const ch of ring.chunks) {
-        if (ch.endMs > cutoff) validSamples += ch.sampleCount;
-      }
-      if (validSamples <= 0) continue;
-      validSamples = Math.min(validSamples, TOTAL_CLIP_SAMPLES);
-
-      let readIdx = (ring.writeIndex - validSamples + TOTAL_CLIP_SAMPLES) % TOTAL_CLIP_SAMPLES;
-      let offset = TOTAL_CLIP_SAMPLES - validSamples;
-
-      for (let i = 0; i < validSamples; i++) {
-        const sample = ring.buffer[(readIdx + i) % TOTAL_CLIP_SAMPLES];
-        const resIdx = offset + i;
-        result[resIdx] = Math.max(-32768, Math.min(32767, result[resIdx] + sample));
+      for (let i = 0; i < TOTAL_CLIP_SAMPLES; i++) {
+        const readIdx = (endIndex - TOTAL_CLIP_SAMPLES + i + TOTAL_CLIP_SAMPLES) % TOTAL_CLIP_SAMPLES;
+        result[i] += ring.buffer[readIdx];
       }
       mixedCount++;
     }
+
+    // Clamp the mixed values to 16-bit integer range
+    for (let i = 0; i < TOTAL_CLIP_SAMPLES; i++) {
+        result[i] = Math.max(-32768, Math.min(32767, result[i]));
+    }
+
     return result;
   }
 
@@ -379,7 +382,7 @@ class GuildManager {
           const windowStart = now - cutoff;
 
           const memberIds = Array.from(state.userRings.entries())
-            .filter(([uid, ring]) => ring && ring.chunks && ring.chunks.some(ch => ch.endMs > windowStart))
+            .filter(([uid, ring]) => ring && ring.lastWriteTimeMs > windowStart)
             .filter(([uid]) => uid !== botId)
             .filter(([uid]) => includeBots || !(guild.members.cache.get(uid)?.user?.bot))
             .map(([uid]) => uid);
