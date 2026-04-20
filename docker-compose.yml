@@ -38,3 +38,4 @@ services:
     # Mount clips folder for persistence if desired
     volumes:
       - ./public/clips:/app/public/clips
+      - ./data:/app/data
