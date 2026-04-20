@@ -1,3 +1,5 @@
+require("libsodium-wrappers");
+require("@snazzah/davey");
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
