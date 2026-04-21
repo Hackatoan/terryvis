@@ -249,24 +249,24 @@ class GuildManager {
     const state = this.getGuildState(guildId);
     let ring = state.userRings.get(userId);
     if (!ring) {
-      ring = { buffer: new Int16Array(TOTAL_CLIP_SAMPLES), lastWriteTimeMs: 0 };
+      ring = { buffer: new Int16Array(TOTAL_CLIP_SAMPLES), lastWriteTimeMs: 0, writePos: 0 };
       state.userRings.set(userId, ring);
     }
     const buf = ring.buffer;
     const now = Date.now();
     const pcmSamples = pcm16Stereo.length;
 
-    // 96 samples per ms for 48000Hz stereo
-    const endIndex = Math.floor(now * 96) % TOTAL_CLIP_SAMPLES;
-    let startIndex = (endIndex - pcmSamples + TOTAL_CLIP_SAMPLES) % TOTAL_CLIP_SAMPLES;
+    // If this is the first packet or there has been a gap > 100ms, snap the writePos to the absolute time.
+    // Otherwise, just advance writePos sequentially to avoid jitter/overlaps within continuous speech.
+    const gapMs = ring.lastWriteTimeMs > 0 ? (now - ring.lastWriteTimeMs) : Infinity;
 
-    for (let i = 0; i < pcmSamples; i++) {
-      buf[(startIndex + i) % TOTAL_CLIP_SAMPLES] = pcm16Stereo[i];
-    }
+    if (gapMs > 100) {
+      // Re-align to global clock based on Date.now()
+      const endIndex = Math.floor(now * 96) % TOTAL_CLIP_SAMPLES;
+      ring.writePos = (endIndex - pcmSamples + TOTAL_CLIP_SAMPLES) % TOTAL_CLIP_SAMPLES;
 
-    if (ring.lastWriteTimeMs > 0) {
-      const gapMs = now - (pcmSamples / 96) - ring.lastWriteTimeMs;
-      if (gapMs > 0) {
+      // Clear the gap in the buffer from where we left off
+      if (ring.lastWriteTimeMs > 0) {
         let gapSamplesToClear = Math.floor(gapMs * 96);
         if (gapSamplesToClear > TOTAL_CLIP_SAMPLES) gapSamplesToClear = TOTAL_CLIP_SAMPLES;
         let clearStartIndex = Math.floor(ring.lastWriteTimeMs * 96) % TOTAL_CLIP_SAMPLES;
@@ -275,12 +275,23 @@ class GuildManager {
         }
       }
     }
-    ring.lastWriteTimeMs = now;
+
+    for (let i = 0; i < pcmSamples; i++) {
+      buf[ring.writePos] = pcm16Stereo[i];
+      ring.writePos = (ring.writePos + 1) % TOTAL_CLIP_SAMPLES;
+    }
+
+    // Since we write sequentially, the "effective" write time increments by exactly the duration of the packet
+    if (gapMs > 100) {
+      ring.lastWriteTimeMs = now;
+    } else {
+      ring.lastWriteTimeMs += (pcmSamples / 96);
+    }
   }
 
   getLast30sMix(guildId, userIds) {
     const state = this.getGuildState(guildId);
-    const result = new Int16Array(TOTAL_CLIP_SAMPLES);
+    const result = new Float32Array(TOTAL_CLIP_SAMPLES);
     const now = Date.now();
     const cutoffMs = now - (CLIP_SECONDS * 1000);
     const endIndex = Math.floor(now * 96) % TOTAL_CLIP_SAMPLES;
@@ -298,12 +309,16 @@ class GuildManager {
       mixedCount++;
     }
 
-    // Clamp the mixed values to 16-bit integer range
+    // Hard clamp / soft-limit to 16-bit integer range
+    const finalResult = new Int16Array(TOTAL_CLIP_SAMPLES);
     for (let i = 0; i < TOTAL_CLIP_SAMPLES; i++) {
-        result[i] = Math.max(-32768, Math.min(32767, result[i]));
+        let val = result[i];
+        if (val > 32767) val = 32767;
+        else if (val < -32768) val = -32768;
+        finalResult[i] = val;
     }
 
-    return result;
+    return finalResult;
   }
 
   addUserClip(userId, title, url, guildId) {

@@ -12,10 +12,16 @@ function downsampleTo16kMono(pcm48kStereo) {
   const out16k = new Int16Array(Math.floor(numSamples / 3));
   let outIdx = 0;
   for (let i = 0; i < numSamples; i += 3) {
-    if (i * 2 + 1 >= pcm48kStereo.length) break;
-    const l = pcm48kStereo[i * 2];
-    const r = pcm48kStereo[i * 2 + 1];
-    out16k[outIdx++] = (l + r) / 2;
+    if ((i + 2) * 2 + 1 >= pcm48kStereo.length) break;
+
+    // Simple 3-tap averaging filter (moving average) across the stereo pairs
+    let sum = 0;
+    for (let j = 0; j < 3; j++) {
+      const idx = (i + j) * 2;
+      sum += (pcm48kStereo[idx] + pcm48kStereo[idx + 1]) / 2;
+    }
+
+    out16k[outIdx++] = sum / 3;
   }
   return out16k;
 }
