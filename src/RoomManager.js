@@ -6,8 +6,6 @@
 const fs   = require('fs');
 const path = require('path');
 const wav  = require('wav');
-const AsrClient = require('./AsrClient');
-
 const CLIP_SECONDS      = 30;
 const CLIP_SAMPLE_RATE  = 48000;
 const CLIP_CHANNELS     = 2;
@@ -51,8 +49,8 @@ class RoomManager {
     this.matrixClient = matrixClient;
     this.webUI = webUI;
     this.rooms = new Map();       // roomId → state
-    this.livekitManager = null;   // set after construction to avoid circular dep
-    this.asrClient = new AsrClient(webUI, this);
+    this.livekitManager = null;   // set after construction
+    this.asrClient = null;        // set after construction (MatrixAsrClient injected externally)
   }
 
   getRoomState(roomId) {
@@ -111,8 +109,8 @@ class RoomManager {
     }
     ring.lastWriteTimeMs = gapMs > 100 ? now : ring.lastWriteTimeMs + pcmLen / 96;
 
-    // Voice trigger detection — feed to ASR
-    this.asrClient.handleAudioFrame(roomId, userId, pcm16Stereo);
+    // Voice trigger detection — feed to ASR if available
+    if (this.asrClient) this.asrClient.handleAudioFrame(roomId, userId, pcm16Stereo);
   }
 
   getLast30sMix(roomId, userIds) {
